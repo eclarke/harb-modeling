@@ -1,0 +1,178 @@
+---
+title: "MIRA 16S Autoregression Modeling"
+author: "Erik Clarke"
+date: "6/6/2018"
+output: 
+  html_document:
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+params:
+  fig_fp: "figures"
+  genus: "Pseudomonas"
+  abx: "cefepime"
+---
+
+Click on "Code" for information on packages loaded for this analysis.
+```{r setup, collapse=TRUE}
+library(here)
+library(tidyverse); print(packageVersion("tidyverse"))
+library(phyloseq)
+library(rethinking)
+library(bayesplot)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  results="hide",
+  warning=FALSE,
+  message = FALSE,
+  fig.width=5,
+  fig.height = 3)
+
+fig_fp <- params$fig_fp
+if (!dir.exists(here(fig_fp))) {
+  dir.create(here(fig_fp))
+}
+
+source(here("shared_functions.R"))
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+## Data
+
+For these models, we are aggregating counts and considering only the `r params$genus` genus and `r params$abx` antibiotic.
+The response variable will be the raw read counts, while the treatment will be a binary yes/no for
+`r params$abx` administration on the previous day (either that or no abx), and the previous day's read counts for 
+`r params$genus` (standardized).
+
+```{r load-data, cache=TRUE}
+mira <- load_mira_data(
+  seqtab_fp = here("../shared/data/seqtab.rds"),
+  taxa_fp = here("../shared/data/taxa.rds"),
+  specimen_fp = here("../shared/data/MIRA_Specimen_Table.csv")
+)
+seqs <- mira$seqs
+mira <- mira$ps
+
+# Keep only the samples with abx data
+mira.abx <- prune_samples(!is.na(sample_data(mira)$abx_b_number), mira)
+# Converted to melted form
+agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count")
+d <- agg %>%
+  filter(specimen_type %in% c("Stool Swab", "Oral Swab", "Sputum")) %>%
+  # Calculate total reads
+  group_by(specimen_id2) %>%
+  mutate(total_reads = sum(read_count)) %>%
+  ungroup() %>%
+  # Collapse reads by genus
+  filter(!is.na(Genus)) %>%
+  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus) %>%
+  summarise(read_count = sum(read_count)) %>%
+  filter(Genus == params$genus) %>%
+  left_join(sample_data(mira.abx)) %>%
+  # Isolate to instances of target antibiotic
+  ungroup() %>%
+  separate_rows(abx_b) %>%
+  filter(abx_b == params$abx | is.na(abx_b)) %>%
+  # Set up lag variables, removing days with > 1 day since previous sampling
+  group_by(specimen_type, subject_id) %>%
+  arrange(study_day) %>%
+  mutate(day_delta = study_day - lag(study_day)) %>%
+  mutate(lag_count = lag(read_count)) %>%
+  mutate(lag_abx_yn = ifelse(is.na(lag(abx_b)), 0, 1)) %>%
+  ungroup() 
+  
+```
+
+```{r shared-functions}
+run_over_specimen_types <- function(d, formula, chains=2, iter=2000, ...) {
+  run_model <- function(flist, data, model, ...) {
+    if (missing(flist)) {
+      if (missing(model)) {
+        stop("Must give either a flist or model")
+      }
+      map2stan(
+        flist=model,
+        data=as.data.frame(data),
+        ...
+      )
+    } else {
+      map2stan(
+        flist=flist,
+        data=as.data.frame(data),
+        ...
+      )
+    }
+
+  } 
+  
+  flist=NULL
+  models <- list()
+  for (type in c("Stool Swab", "Oral Swab", "Sputum")) {
+    d2 <- filter(d, specimen_type == type)# %>%
+      # select(read_count, total_reads, specimen_id, subject_id, lag_count_s, lag_abx_yn)
+    if (is.null(flist)) {
+      flist <- formula
+      m <- run_model(flist=flist, data=d2, chains=chains, iter=iter, ...)
+      flist <- m
+      print(type)
+      print(precis(m))
+      models[[type]] <- m
+    } else {
+      print("Skipping model compilation")
+      m <- run_model(data=d2, model=flist, chains=chains, iter=iter, ...)
+      print(type)
+      print(precis(m))
+      models[[type]] <- m
+    }
+  }
+  models
+}
+```
+
+
+## Model 1: Binomial model with specimen and subject intercepts
+
+```{r, results="hide"}
+
+f1.0 <- alist(
+  read_count ~ dbinom(total_reads, prob),
+  logit(prob) <- a_0 + a_specimen[specimen_id2] + a_subject[subject_id],
+  a_0 ~ dnorm(0,10),
+  a_specimen[specimen_id2] ~ dnorm(0, sigma_specimen),
+  a_subject[subject_id] ~ dnorm(0, sigma_subject),
+  sigma_specimen ~ dcauchy(0,1),
+  sigma_subject ~ dcauchy(0,1)
+)
+
+m1.0 <- d %>%
+  run_over_specimen_types(
+    f1.0, iter = 4000, chains=4, cores=4, WAIC=F, control=list(adapt_delta=0.9, max_treedepth=12))
+```
+
+```{r}
+invisible(with(data.frame(), {
+  browser()
+  specimen_type = "Sputum"
+  m <- m1.0[[specimen_type]]
+}))
+```
+
+```{r m1.1}
+d1.1 <- as.list(d %>% filter(
+  subject_id == "MIRA_013", specimen_type=="Sputum") %>%
+  select(read_count, total_reads, specimen_id2)  %>%
+  mutate(specimen_id2 = as.integer(as.factor(specimen_id2))) %>%
+  mutate(emp_prob = read_count/total_reads))
+d1.1$N <- length(d1.1$read_count)
+d1.1$N_specimen_id2 <- n_distinct(d1.1$specimen_id2)
+m1.1 <- stan(file="arb_1.1.stan", data=d1.1)
+
+```
+
