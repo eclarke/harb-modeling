@@ -1,10 +1,8 @@
 ---
-title: "MIRA 16S Autoregression Modeling"
+title: "Hierarchical, autoregressive binomial models for MIRA 16S data"
 author: "Erik Clarke"
-date: "6/6/2018"
-output: 
-  html_document:
-    code_folding: show
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: github_document
 editor_options: 
   chunk_output_type: console
 params:
@@ -139,6 +137,10 @@ run_over_specimen_types <- function(d, formula, chains=2, iter=2000, ...) {
 
 ## Model 1: Binomial model with specimen and subject intercepts
 
+### Model 1.0
+
+Random intercepts for specimen and subject.
+
 ```{r, results="hide"}
 
 f1.0 <- alist(
@@ -151,18 +153,14 @@ f1.0 <- alist(
   sigma_subject ~ dcauchy(0,1)
 )
 
-m1.0 <- d %>%
+m1.0 <- d %>% filter(day_)
   run_over_specimen_types(
     f1.0, iter = 4000, chains=4, cores=4, WAIC=F, control=list(adapt_delta=0.9, max_treedepth=12))
 ```
 
-```{r}
-invisible(with(data.frame(), {
-  browser()
-  specimen_type = "Sputum"
-  m <- m1.0[[specimen_type]]
-}))
-```
+### Model 1.1
+
+Single-subject, random intercepts on specimen, autoregressive on previous day.
 
 ```{r m1.1}
 d1.1 <- as.list(d %>% filter(
@@ -172,7 +170,25 @@ d1.1 <- as.list(d %>% filter(
   mutate(emp_prob = read_count/total_reads))
 d1.1$N <- length(d1.1$read_count)
 d1.1$N_specimen_id2 <- n_distinct(d1.1$specimen_id2)
-m1.1 <- stan(file="arb_1.1.stan", data=d1.1)
+writeLines(readLines("arb_1.1.stan"))
+m1.1 <- stan(file="arb_1.1.stan", data=d1.1, iter=5000, warmup=1000, control=list(max_treedepth=15, adapt_delta=0.9))
 
 ```
 
+### Model 1.2
+
+Same as 1.1, but now also with a binary predictor for `r params$abx`.
+
+```{r m1.2}
+d1.2 <- as.list(d %>% filter(
+  subject_id == "MIRA_013", specimen_type=="Sputum") %>%
+  mutate(abx_yn = !is.na(abx_b)) %>%
+  select(read_count, total_reads, abx_yn, specimen_id2)  %>%
+  mutate(specimen_id2 = as.integer(as.factor(specimen_id2))) %>%
+  mutate(emp_prob = read_count/total_reads))
+d1.2$N <- length(d1.2$read_count)
+d1.2$N_specimen_id2 <- n_distinct(d1.2$specimen_id2)
+writeLines(readLines("arb_1.2.stan"))
+m1.2 <- stan(file="arb_1.2.stan", data=d1.2, iter=5000, warmup=1000, control=list(max_treedepth=15, adapt_delta=0.9))
+
+```
