@@ -18,6 +18,7 @@ library(tidyverse); print(packageVersion("tidyverse"))
 library(phyloseq)
 library(rethinking)
 library(bayesplot)
+library(tidybayes)
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
@@ -180,15 +181,46 @@ m1.1 <- stan(file="arb_1.1.stan", data=d1.1, iter=5000, warmup=1000, control=lis
 Same as 1.1, but now also with a binary predictor for `r params$abx`.
 
 ```{r m1.2}
-d1.2 <- as.list(d %>% filter(
-  subject_id == "MIRA_013", specimen_type=="Sputum") %>%
+d1.2 <- d %>% filter(
+  subject_id == "MIRA_005", specimen_type=="Oral Swab") %>%
   mutate(abx_yn = !is.na(abx_b)) %>%
-  select(read_count, total_reads, abx_yn, specimen_id2)  %>%
-  mutate(specimen_id2 = as.integer(as.factor(specimen_id2))) %>%
-  mutate(emp_prob = read_count/total_reads))
-d1.2$N <- length(d1.2$read_count)
-d1.2$N_specimen_id2 <- n_distinct(d1.2$specimen_id2)
+  select(read_count, total_reads, abx_yn, study_day, specimen_id2)  %>%
+  mutate(specimen_id2 = as.factor(specimen_id2)) %>%
+  mutate(study_day = study_day) %>%
+  mutate(emp_prob = read_count/total_reads)
+
 writeLines(readLines("arb_1.2.stan"))
-m1.2 <- stan(file="arb_1.2.stan", data=d1.2, iter=5000, warmup=1000, control=list(max_treedepth=15, adapt_delta=0.9))
+
+m1.2 <- stan(
+  file="arb_1.2.stan", data=compose_data(d1.2), iter=5000, chains=3,
+  control=list(max_treedepth=15, adapt_delta=0.99))
 
 ```
+
+```{r}
+post1.2 <- spread_samples(m1.2, a_0, b_lag, b_abx) 
+pred1.2 <- matrix(data=NA, nrow = 7500, ncol=nrow(d1.2))
+emp_pred1.2 <- pred1.2
+pred1.2[,1] <- d1.2$read_count[1]
+emp_pred1.2[,1] <- d1.2$emp_prob[1]
+for (i in 2:nrow(d1.2)) {
+  pred1.2[,i] <- with(
+    post1.2, 
+    rbinom(7500, size=d1.2$total_reads[i], 
+           prob=logistic(a_0 + b_lag*(pred1.2[,i-1]/d1.2$total_reads[i-1]) + b_abx*d1.2$abx_yn[i-1])))
+  emp_pred1.2[,i] <- pred1.2[,i]/d1.2$total_reads[i]
+}
+colnames(emp_pred1.2) <- paste0("X", d1.2$study_day)
+pred1.2.df <- gather(data.frame(emp_pred1.2))
+pred1.2.df$key <- as.numeric(str_replace(pred1.2.df$key, "X", ""))
+pred1.2.df <- group_by(pred1.2.df, key) %>%
+  mutate(sample = seq_along(value))
+pred1.2.df <- filter(pred1.2.df, sample < 100)
+
+ggplot(pred1.2.df, aes(key, value, group=sample)) + geom_line(alpha=0.1) +
+  geom_line(data=d1.2, aes(study_day, emp_prob, color="empirical", group=NULL)) +
+  geom_vline(data=d1.2, aes(xintercept=study_day, alpha=abx_yn), linetype=2) +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0)) +
+  scale_y_continuous(expand=c(0,0), labels=scales::percent)
+```
+
