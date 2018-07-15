@@ -402,6 +402,20 @@ bayesplot::mcmc_trace(extract(m1.4.2, inc_warmup=F, permuted=F), pars=c("mu", "s
 pairs(m1.4.2, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
 ```
 
+This model converges fine and seems reasonable. I'm not simulating from the posterior yet.
 
+### Model 1.4.3
 
+Let's add a subject-level effect for antibiotics without pooling (for now).
+My intuition for this will be that it fits slower, and has a hard time converging.
+I may have been better off estimating b_abx with complete pooling.
+
+```{r}
+m1.4.3 <- stan(
+  file="arb_1.4.3.stan", data=d1.4.1, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+
+bayesplot::mcmc_trace(extract(m1.4.3, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
+pairs(m1.4.3, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
+```
 
