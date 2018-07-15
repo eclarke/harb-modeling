@@ -19,6 +19,7 @@ library(phyloseq)
 library(rethinking)
 library(bayesplot)
 library(tidybayes)
+library(ggbeeswarm)
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
@@ -317,4 +318,90 @@ m1.3.3 <- stan(
   file="arb_1.3.3.stan", data=compose_data(d1.3), iter=5000, chains=3,
   control=list(max_treedepth=15))
 ```
+
+I've added a 'generated quantities' block that converts back from alpha_std to alpha, 
+and these values recapitulate what I got from m1.3.2 (the centered version).
+
+Okay. So this is the "gold standard" for now. 
+
+## Model 1.4
+
+In this model I want to explore subject-level random effects. It should be as easy as 
+adding a second non-centered reparameterization around a second alpha, right?
+
+For sanity's sake, I'm removing the lag and antibiotic terms for now.
+
+```{r}
+d1.4 <- d %>% filter(
+  subject_id %in% c("MIRA_005", "MIRA_004", "MIRA_007"), specimen_type=="Oral Swab") %>%
+  mutate(abx_yn = !is.na(abx_b)) %>%
+  select(read_count, total_reads, abx_yn, study_day, subject_id, specimen_id2)  %>%
+  mutate(specimen_id2 = as.factor(specimen_id2)) %>%
+  mutate(subject_id = as.factor(droplevels(subject_id))) %>%
+  mutate(study_day = study_day) %>%
+  mutate(emp_prob = read_count/total_reads)
+
+m1.4.0 <- stan(
+  file="arb_1.4.0.stan", data=compose_data(d1.4), iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+
+bayesplot::mcmc_trace(extract(m1.4.0, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]"))
+pairs(m1.4.0, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]"))
+```
+
+Couple of things to note: 
+
+- Though I expected it to be a 1-to-1 relationship, putting the transformed random intercepts in the 
+transformed parameters block led to serious divergences. I'm keeping them outside that block now, in the model block.
+- I've used exponential priors for the sigma terms here but I'm not sure they're necessary. 
+- This samples relatively efficiently.
+
+```{r}
+invisible(with(data.frame(), {
+  browser()
+  post <- tidybayes::spread_samples(model=m1.4.0, a_subj[subject_id], sigma_subj) %>%
+    group_by(subject_id)
+  .d <- d1.4 %>% mutate(subject_id = as.integer(subject_id))
+  ggplot(post, aes(subject_id, logistic(a_subj), group=subject_id)) + geom_quasirandom(shape=21) +
+    geom_quasirandom(data=.d, aes(y=emp_prob))
+}))
+
+```
+
+This shows the subject-level intercepts reasonably reconstituting the empirical data. They're all
+pulled towards zero, which I expect is closer to the median thanks to the one subject of the three
+that's mostly zero.
+
+### Model 1.4.1
+
+Let's explore now how to add a lag term to this model. First I'll start by rewriting it
+to be "ragged"; i.e. each subject's terms are fit separately. 
+
+```{r}
+d1.4.1 <- d1.4 %>% arrange(subject_id, study_day) %>% compose_data()
+d1.4.1$n_obs_subject <- (d1.4 %>% group_by(subject_id) %>% summarize(n = n()))$n
+
+m1.4.1 <- stan(
+  file="arb_1.4.1.stan", data=d1.4.1, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+```
+
+This model works about as well as 1.4.0. The estimates are very similar.
+
+### Model 1.4.2
+
+Now that we have a for-loop over each subject, we should be able to add the 
+correct lag term.
+
+```{r}
+m1.4.2 <- stan(
+  file="arb_1.4.2.stan", data=d1.4.1, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+
+bayesplot::mcmc_trace(extract(m1.4.2, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+pairs(m1.4.2, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+```
+
+
+
 
