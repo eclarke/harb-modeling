@@ -151,10 +151,10 @@ f1.0 <- alist(
   a_specimen[specimen_id2] ~ dnorm(0, sigma_specimen),
   a_subject[subject_id] ~ dnorm(0, sigma_subject),
   sigma_specimen ~ dcauchy(0,1),
-  sigma_subject ~ dcauchy(0,1)
+  sigma_subject ~ dexp(1)
 )
 
-m1.0 <- d %>% filter(day_)
+m1.0 <- d %>% 
   run_over_specimen_types(
     f1.0, iter = 4000, chains=4, cores=4, WAIC=F, control=list(adapt_delta=0.9, max_treedepth=12))
 ```
@@ -198,7 +198,7 @@ m1.2 <- stan(
 ```
 
 ```{r}
-post1.2 <- spread_samples(m1.2, a_0, b_lag, b_abx) 
+post1.2 <- spread_samples(m1.2.3, a_0, b_lag, b_abx) 
 pred1.2 <- matrix(data=NA, nrow = 7500, ncol=nrow(d1.2))
 emp_pred1.2 <- pred1.2
 pred1.2[,1] <- d1.2$read_count[1]
@@ -222,5 +222,99 @@ ggplot(pred1.2.df, aes(key, value, group=sample)) + geom_line(alpha=0.1) +
   geom_vline(data=d1.2, aes(xintercept=study_day, alpha=abx_yn), linetype=2) +
   scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0)) +
   scale_y_continuous(expand=c(0,0), labels=scales::percent)
+```
+
+### Model 1.2.1
+
+Alternative parameterization of the half-Cauchy
+
+- exp(1)
+
+```{r}
+.m <- map2stan(alist(
+  read_count ~ dbinom(total_reads, prob),
+  logit(prob) <- a_0 + a_specimen[specimen_id2],
+  a_0 ~ dnorm(0,10),
+  a_specimen[specimen_id2] ~ dnorm(0, sigma_specimen),
+  sigma_specimen ~ dexp(1)
+), data=data.frame(d1.2), WAIC=F)
+```
+
+
+```{r m1.2}
+
+writeLines(readLines("arb_1.2.1.stan"))
+
+m1.2.1 <- stan(
+  file="arb_1.2.1.stan", data=compose_data(d1.2), iter=5000, chains=3,
+  control=list(max_treedepth=15, adapt_delta=0.99))
+m1.2.2 <- stan(
+  file="arb_1.2.2.stan", data=compose_data(d1.2), iter=5000, chains=3,
+  control=list(max_treedepth=15, adapt_delta=0.99))
+# 1.2, but with transformed cauchy
+m1.2.3 <- stan(
+  file="arb_1.2.3.stan", data=compose_data(d1.2), iter=5000, chains=3,
+  control=list(max_treedepth=15, adapt_delta=0.99))
+```
+
+## Model 1.3
+
+Revisiting the intercept-only model to explore better parameterizations.
+
+This goes right back to the start with no separate intercept `a_0`, just specimen-level intercepts.
+```{r}
+d1.3 <- d %>% filter(
+  subject_id == "MIRA_005", specimen_type=="Oral Swab") %>%
+  mutate(abx_yn = !is.na(abx_b)) %>%
+  select(read_count, total_reads, abx_yn, study_day, specimen_id2)  %>%
+  mutate(specimen_id2 = as.factor(specimen_id2)) %>%
+  mutate(study_day = study_day) %>%
+  mutate(emp_prob = read_count/total_reads)
+
+writeLines(readLines("arb_1.2.stan"))
+
+m1.3.0 <- stan(
+  file="arb_1.3.0.stan", data=compose_data(d1.3), iter=5000, chains=3)
+#  control=list(max_treedepth=15, adapt_delta=0.9))
+
+```
+
+### Model 1.3.1
+
+This one changes things up a little. We use non-centered intercepts for the specimens and add back the lag parameter.
+
+The tree depth is important here (max = 15).
+
+```{r}
+
+m1.3.1 <- stan(
+  file="arb_1.3.1.stan", data=compose_data(d1.3), iter=5000, chains=3,
+  control=list(max_treedepth=15))
+```
+
+### Model 1.3.2
+
+Do centered vs non-centered parameterizations matter? This model uses centered parameterizations:
+
+```{r}
+
+m1.3.2 <- stan(
+  file="arb_1.3.2.stan", data=compose_data(d1.3), iter=5000, chains=3,
+  control=list(max_treedepth=15))
+```
+
+`n_eff` is generally higher in m1.3.1, indicating that non-centered parameterization does indeed lead to 
+a bit more efficient sampler. 
+
+### Model 1.3.3 
+
+The return of antibiotic effects! And non-centered parameterization.
+Notes: I had to use `vector[n] abx_yn` rather than a better `int abx_yn[n]` due to 
+the vector slicing notation we're using.
+
+```{r}
+m1.3.3 <- stan(
+  file="arb_1.3.3.stan", data=compose_data(d1.3), iter=5000, chains=3,
+  control=list(max_treedepth=15))
 ```
 
