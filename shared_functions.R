@@ -96,3 +96,14 @@ agglomerated_to_phyloseq <- function(agg, otu_col, sample_col, count_col, ...) {
     tax_table(taxa)
   )
 }
+
+effective_window <- function(x, lag=2, lead=3) {
+  l <- length(x)
+  x2 <- rep(FALSE, l)
+  for (i in 2:l) {
+    if (!is.na(x[i]) & x[i]) {
+      x2[seq(i+lag,i+lead)] <- TRUE
+    }
+  }
+  x2[1:l]
+}

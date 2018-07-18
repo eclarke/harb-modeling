@@ -437,7 +437,7 @@ pairs(m1.4.4, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_
 This fits okay on the restricted 3-subject dataset, so let's try it on the full dataset:
 
 ```{r}
-d1.4.4 <- d %>% filter(specimen_type=="Oral Swab") %>%
+d1.4.4.os <- d %>% filter(specimen_type=="Oral Swab") %>%
   group_by(subject_id) %>%
   filter(n() > 1) %>%
   ungroup() %>%
@@ -447,54 +447,86 @@ d1.4.4 <- d %>% filter(specimen_type=="Oral Swab") %>%
   mutate(subject_id = as.factor(droplevels(subject_id))) %>%
   mutate(study_day = study_day) %>%
   mutate(emp_prob = read_count/total_reads)
-d1.4.4a <- d1.4.4 %>% arrange(subject_id, study_day) %>% compose_data()
-d1.4.4a$n_obs_subject <- (d1.4.4 %>% group_by(subject_id) %>% summarize(n = n()))$n
+d1.4.4.osl <- d1.4.4.os %>% arrange(subject_id, study_day) %>% compose_data()
+d1.4.4.osl$n_obs_subject <- (d1.4.4.os %>% group_by(subject_id) %>% summarize(n = n()))$n
 
 m1.4.4a <- stan(
-  file="arb_1.4.4.stan", data=d1.4.4a, iter=2000, chains=4,
+  file="arb_1.4.4.stan", data=d1.4.4.osl, iter=2000, chains=4,
   control=list(max_treedepth=17, adapt_delta=0.95))
-saveRDS(m1.4.4a, file = "fit_arb_1.4.4a.rds")
-m1.4.4b <- readRDS("fit_arb_1.4.4a.rds")
+saveRDS(m1.4.4a, file = "fit_arb_1.4.4_oralswab.rds")
+```
+
+It fits! Took about an hour or more to do so.
+
+#### Fitting on other sample types
+
+```{r}
+d1.4.4.sp <- d %>% filter(specimen_type=="Sputum") %>%
+  group_by(subject_id) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  mutate(abx_yn = !is.na(abx_b)) %>%
+  select(read_count, total_reads, abx_yn, study_day, subject_id, specimen_id2)  %>%
+  mutate(specimen_id2 = as.factor(specimen_id2)) %>%
+  mutate(subject_id = as.factor(droplevels(subject_id))) %>%
+  mutate(study_day = study_day) %>%
+  mutate(emp_prob = read_count/total_reads) %>%
+  ungroup() %>%
+  arrange(subject_id, study_day)
+d1.4.4.spl <- compose_data(d1.4.4.sp)
+d1.4.4.spl$n_obs_subject <- (d1.4.4.sp %>% group_by(subject_id) %>% summarize(n = n()))$n
+
+m1.4.4.sp <- stan(
+  file="arb_1.4.4.stan", data=d1.4.4.spl, iter=2000, chains=4,
+  control=list(max_treedepth=17, adapt_delta=0.95))
+saveRDS(m1.4.4.sp, file = "fit_arb_1.4.4_sputum.rds")
+```
+
+
+## Model 1.5
+
+After all the difficulties around 1.4 and vector slicing, I realized that simply by specifying the lagged values
+in the data, we'd recapitulate what we're doing with the slicing operations. Stan is not learning from the 
+previous day's fit, it's learning from the previous day's data just as if we added a lagged value. 
+
+Plus, we would like to add lead and lag times to antibiotic effectiveness. It shouldn't start immediately,
+and shouldn't wear off immediately.
+
+So let's skip all that and try this again.
+
+```{r}
+d1.5.0.sp <- d %>% filter(specimen_type == "Sputum") %>%
+  select(subject_id, specimen_id2, study_day, total_reads, read_count, abx_b) %>%
+  # Remove empty or single-sample subjects
+  group_by(subject_id) %>%
+  filter(n() > 1) %>%
+  arrange(subject_id, study_day) %>%
+  # Establish abx effectiveness periods:
+  # 1) Translate abx to T/F
+  mutate(abx_yn = !is.na(abx_b)) %>%
+  # Fill in missing sampling days
+  tidyr::complete(study_day=full_seq(study_day, 1)) %>%
+  # Establish window for delayed onset and delayed loss
+  mutate(on_abx = effective_window(abx_yn, lag=2, lead=3)) %>%
+  # Add lagged read and empirical proportion terms %>%
+  mutate(lag_count = lag(read_count)) %>%
+  mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
+  # Remove missing cases 
+  filter(!is.na(lag_count) & !is.na(read_count)) %>%
+  ungroup() %>%
+  select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
+  droplevels()
+d1.5.0.spl <- compose_data(d1.5.0.sp)
+
+m1.5.0.sp <- stan(
+  file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
+bayesplot::mcmc_trace(extract(m1.5.0.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
 
 ```{r}
-invisible(with(data.frame(), {
-  browser()
-  .m <- m1.4.4a
-  .d <- d1.4.4
-  post <- spread_samples(.m, mu, b_abx[i], a_subj[i])
-  est <- mean_qi(post)
-  plot(logistic(est$mu + est$a_subj))
-  plot(logistic(est$mu + est$a_subj + est$b_abx))
-  plot(logistic(est$b_abx))
-  logistic(est$mu + est$a_subj + est$b_abx)
-  
-
-  pred <- matrix(data=NA, nrow = 4000, ncol=nrow(.d))
-emp_pred1.2 <- pred1.2
-pred1.2[,1] <- d1.2$read_count[1]
-emp_pred1.2[,1] <- d1.2$emp_prob[1]
-for (i in 2:nrow(d1.2)) {
-  pred1.2[,i] <- with(
-    post1.2, 
-    rbinom(7500, size=d1.2$total_reads[i], 
-           prob=logistic(a_0 + b_lag*(pred1.2[,i-1]/d1.2$total_reads[i-1]) + b_abx*d1.2$abx_yn[i-1])))
-  emp_pred1.2[,i] <- pred1.2[,i]/d1.2$total_reads[i]
-}
-colnames(emp_pred1.2) <- paste0("X", d1.2$study_day)
-pred1.2.df <- gather(data.frame(emp_pred1.2))
-pred1.2.df$key <- as.numeric(str_replace(pred1.2.df$key, "X", ""))
-pred1.2.df <- group_by(pred1.2.df, key) %>%
-  mutate(sample = seq_along(value))
-pred1.2.df <- filter(pred1.2.df, sample < 100)
-
-ggplot(pred1.2.df, aes(key, value, group=sample)) + geom_line(alpha=0.1) +
-  geom_line(data=d1.2, aes(study_day, emp_prob, color="empirical", group=NULL)) +
-  geom_vline(data=d1.2, aes(xintercept=study_day, alpha=abx_yn), linetype=2) +
-  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0)) +
-  scale_y_continuous(expand=c(0,0), labels=scales::percent)
-  
-}))
 
 ```
 
