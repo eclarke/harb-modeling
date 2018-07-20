@@ -494,6 +494,8 @@ and shouldn't wear off immediately.
 
 So let's skip all that and try this again.
 
+### Model 1.5.0
+
 ```{r}
 d1.5.0.sp <- d %>% filter(specimen_type == "Sputum") %>%
   select(subject_id, specimen_id2, study_day, total_reads, read_count, abx_b) %>%
@@ -514,7 +516,7 @@ d1.5.0.sp <- d %>% filter(specimen_type == "Sputum") %>%
   # Remove missing cases 
   filter(!is.na(lag_count) & !is.na(read_count)) %>%
   ungroup() %>%
-  select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
+  # select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
   droplevels()
 d1.5.0.spl <- compose_data(d1.5.0.sp)
 
@@ -526,7 +528,68 @@ bayesplot::mcmc_trace(extract(m1.5.0.sp, inc_warmup=F, permuted=F), pars=c("mu",
 pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
 
-```{r}
+#### Post. predictive
 
+```{r}
+invisible(with(data.frame(), {
+  browser()
+  .m <- m1.5.0.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, sigma_spec, sigma_subj, sigma_abx, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx[subject_id])
+  post$specimen_idx <- as.integer(post$specimen_id2)
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  
+  pp_subject <- function(post, subject, use_a_spec=F) {
+    ps <- post %>% filter(subject_id == subject)
+    stopifnot(nrow(ps) > 0)
+    ps$specimen_idx <- as.integer(as.factor(ps$specimen_id2))
+    cols <- n_distinct(ps$specimen_id2)
+    stopifnot(cols > 1)
+    rows <- nrow(ps)/cols
+    pred_prob <- matrix(data=NA, nrow=rows, ncol=cols) 
+    
+    
+    p.link <- function(d, n, idx, prev_prop) {
+      d2 <- filter(d, specimen_idx == idx)
+      prob <- logistic(with(d2, mu + a_subj + a_spec*use_a_spec + b_lag * prev_prop + b_abx * on_abx))
+      rbinom(n, unique(d2$total_reads), prob)/unique(d2$total_reads)
+    }
+    
+    pred_prob[,1] <- p.link(ps, rows, 1, .d$lag_emp_prop[1])
+    
+    for (i in 2:cols) {
+      pred_prob[,i] <- p.link(ps, rows, i, pred_prob[,i-1])
+    }
+    
+    pred.df <- gather(data.frame(pred_prob)) %>%
+      mutate(key = as.factor(key))
+    levels(pred.df$key) <- levels(as.factor(ps$specimen_id2))
+    
+    pred.df.sub <- group_by(pred.df, key) %>%
+      mutate(group = seq_along(value)) %>%
+      filter(group < 150) %>%
+      rename(specimen_id2=key, pred_prob=value) %>%
+      left_join(.d) %>%
+      mutate(emp_prob = read_count/total_reads)
+    
+    dp = pred.df.sub %>% ungroup %>% distinct(specimen_id2, .keep_all = T)
+    
+    ggplot(pred.df.sub, aes(study_day, pred_prob, group=group)) +
+      geom_line(alpha=0.1) +
+      geom_line(data=dp, aes(y=emp_prob, group=NULL), color="red") +
+      geom_vline(data=dp, aes(xintercept=study_day, alpha=on_abx), linetype=2) +
+      scale_alpha_manual(sprintf("on %s", params$abx), values=c("TRUE"=0.6, "FALSE"=0)) +
+      scale_y_continuous(expand=c(0,0), labels=scales::percent) +
+      ggtitle(subject)
+  }
+  
+  pp_subject_plots <- sapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    pp_subject(post2, s)
+  })
+  
+
+}))
 ```
 
