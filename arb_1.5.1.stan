@@ -36,7 +36,7 @@ model{
   // Full model
   for (i in 1:n) {
     prob[i] = mu + sigma_spec * a_spec_std[specimen_id2[i]] + sigma_subj * a_subj_std[subject_id[i]] +
-    b_lag * lag_emp_prop[i] + sigma_abx * b_abx_std[subject_id[i]] * on_abx[i];
+    b_lag * lag_emp_prop[i] + sigma_abx * b_abx_std[subject_id[i]] * on_abx[i] * lag_emp_prop[i];
   }
   read_count ~ binomial_logit(total_reads, prob);
 }

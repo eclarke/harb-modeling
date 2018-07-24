@@ -11,6 +11,7 @@ params:
   species: "aureus"
   abx: "vancomyciniv"
 ---
+## Setup
 
 Click on "Code" for information on packages loaded for this analysis.
 ```{r setup, collapse=TRUE}
@@ -22,6 +23,7 @@ library(bayesplot)
 library(tidybayes)
 library(ggbeeswarm)
 library(magrittr)
+library(tsibble)
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
@@ -45,8 +47,6 @@ mira_theme <- theme_bw() + theme(
 )
 theme_set(mira_theme)
 ```
-
-## Data
 
 For these models, we are aggregating counts and considering only the `r params$genus` genus and `r params$abx` antibiotic.
 The response variable will be the raw read counts, while the treatment will be a binary yes/no for
@@ -589,29 +589,16 @@ d1.5.0.sp <- d2 %>% filter(specimen_type == "Sputum") %>%
   group_by(subject_id) %>%
   filter(n() > 1) %>%
   arrange(subject_id, study_day) %>%
-  # Establish abx effectiveness periods:
-  # 1) Translate abx to T/F
-  # mutate(abx_yn = !is.na(abx_b)) %>%
   # Fill in missing sampling days
-  tidyr::complete(study_day=full_seq(study_day, 1)) %>%
-  # Establish window for delayed onset and delayed loss
-  mutate(on_abx = effective_window(abx_yn, lag=0, lead=3)) %>%
-  # Add lagged read and empirical proportion terms %>%
+  # tidyr::complete(study_day=full_seq(study_day, 1)) %>%
+  # Add lagged read and empirical proportion terms
   mutate(lag_count = lag(read_count)) %>%
   mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
   # Remove missing cases 
-  # filter(!is.na(lag_count) & !is.na(read_count)) %>%
+  filter(!is.na(lag_count) & !is.na(read_count)) %>%
   ungroup() %>%
   # select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
   droplevels()
-
-d %>% group_by(subject_id) %>%
-  distinct(subject_id, study_day, abx_yn) %>%
-  arrange(subject_id, study_day) %>%
-  tidyr::complete(study_day=full_seq(study_day, 1)) %>%
-  mutate(on_abx = effective_window(abx_yn, lag=0, lead=2)) %>%
-  ggplot(aes(x=as.factor(study_day), y=subject_id, fill=abx_yn)) +
-  geom_tile(color="white")
 
 ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
   geom_point(shape=21) +
@@ -619,7 +606,7 @@ ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group
   geom_vline(aes(xintercept=study_day, alpha=abx_yn)) +
   scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
   scale_y_continuous(labels=scales::percent) +
-  facet_wrap(~ subject_id, scales="free")
+  facet_wrap(~ subject_id, scales="free", ncol=3)
 
 ```
 
@@ -710,6 +697,14 @@ Previously the lag proportions and the abx effect were additive. This next model
 has them interacting.
 
 ```{r}
-
+m1.5.1.sp <- stan(
+  file="arb_1.5.1.stan", data=d1.5.0.spl, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+saveRDS(m1.5.1.sp, file="fit_arb_1.5.1_sputum.rds")
+p1.5.1.sp <- recover_types(m1.5.1.sp, d1.5.0.sp) %>%
+  spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
+median_qi(p1.5.1.sp)
+bayesplot::mcmc_trace(extract(m1.5.1.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+pairs(m1.5.1.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
 
