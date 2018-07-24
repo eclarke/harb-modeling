@@ -7,8 +7,9 @@ editor_options:
   chunk_output_type: console
 params:
   fig_fp: "figures"
-  genus: "Pseudomonas"
-  abx: "cefepime"
+  genus: "Staphylococcus"
+  species: "aureus"
+  abx: "vancomyciniv"
 ---
 
 Click on "Code" for information on packages loaded for this analysis.
@@ -20,6 +21,7 @@ library(rethinking)
 library(bayesplot)
 library(tidybayes)
 library(ggbeeswarm)
+library(magrittr)
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
@@ -52,43 +54,127 @@ The response variable will be the raw read counts, while the treatment will be a
 `r params$genus` (standardized).
 
 ```{r load-data, cache=TRUE}
-mira <- load_mira_data(
+mira.all <- load_mira_data(
   seqtab_fp = here("../shared/data/seqtab.rds"),
   taxa_fp = here("../shared/data/taxa.rds"),
+  meds_fp = here("../shared/data/MIRA_Medications_Table.csv"),
   specimen_fp = here("../shared/data/MIRA_Specimen_Table.csv")
 )
-seqs <- mira$seqs
-mira <- mira$ps
 
-# Keep only the samples with abx data
-mira.abx <- prune_samples(!is.na(sample_data(mira)$abx_b_number), mira)
+seqs <- mira.all$seqs
+meds <- mira.all$meds
+mira <- mira.all$ps
+
+# Remove non-MIRA subjects from dataset (incl. blanks and controls)
+.nonmira <- is.na(sample_data(mira)$subject_id)
+print(sprintf("Removing %d non-MIRA samples...", sum(.nonmira)))
+mira <- prune_samples(!.nonmira, mira)
+# Remove culture samples (they break the subject/type/date unique constraint)
+.culture <- grepl("Culture", sample_data(mira)$specimen_type)
+print(sprintf("Removing %d culture samples...", sum(.culture)))
+mira <- prune_samples(!.culture, mira)
+# Remove empty samples
+.empty <- sample_sums(mira) == 0
+print(sprintf("Removing %d empty samples...", sum(.empty)))
+mira <- prune_samples(!.empty, mira)
+
+# Identify "duplicated" specimens (same subject, specimen type, and study day)
+sample_data(mira) <- sample_data(mira) %>% 
+  group_by(subject_id, specimen_type, study_day) %>%
+  # "specimen_id3" has the same value for duplicated specimens so phyloseq can 
+  # use it as a grouping level
+  mutate(specimen_id3 = case_when(
+    n() > 1 ~ paste0(first(as.character(specimen_id2)), "_D"),
+    TRUE ~ as.character(specimen_id2)
+  )) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Sum abundances and merge sample table for duplicates
+mira <- phyloseq::merge_samples(mira, "specimen_id3", fun=sum)
+# Re-add the relevant metadata since merge_samples mangles factors and dates
+sample_data(mira) <- sample_data(mira) %>% 
+  mutate(specimen_id2 = rownames(.)) %>%
+  select(specimen_id2, specimen_id3) %>%
+  left_join(mira.all$samples) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Restrict to only samples for which we have abx data
+.abx_specimens <- as.character(inner_join(sample_data(mira), meds)$specimen_id2)
+mira.abx <- prune_samples(
+  sample_data(mira)$specimen_id2 %in% .abx_specimens, mira)
+
 # Converted to melted form
 agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count")
 d <- agg %>%
-  filter(specimen_type %in% c("Stool Swab", "Oral Swab", "Sputum")) %>%
   # Calculate total reads
   group_by(specimen_id2) %>%
   mutate(total_reads = sum(read_count)) %>%
   ungroup() %>%
-  # Collapse reads by genus
-  filter(!is.na(Genus)) %>%
-  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus) %>%
+  # Collapse reads by genus/species
+  filter(!is.na(Genus), !is.na(Species)) %>%
+  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
   summarise(read_count = sum(read_count)) %>%
-  filter(Genus == params$genus) %>%
-  left_join(sample_data(mira.abx)) %>%
-  # Isolate to instances of target antibiotic
   ungroup() %>%
-  separate_rows(abx_b) %>%
-  filter(abx_b == params$abx | is.na(abx_b)) %>%
-  # Set up lag variables, removing days with > 1 day since previous sampling
-  group_by(specimen_type, subject_id) %>%
-  arrange(study_day) %>%
-  mutate(day_delta = study_day - lag(study_day)) %>%
-  mutate(lag_count = lag(read_count)) %>%
-  mutate(lag_abx_yn = ifelse(is.na(lag(abx_b)), 0, 1)) %>%
-  ungroup() 
+  filter(Genus == params$genus) %>%
+  filter(Species == params$species) %>%
+  left_join(sample_data(mira.abx)) %>%
+  select(-c(Kingdom:Family))
+
+# Calculate antibiotic effectiveness windows
+subjects <- sample_data(mira.abx) %>%
+  group_by(subject_id) %>% 
+  mutate(exit_date = max(collection_date)) %>%
+  distinct(subject_id, enroll_date, exit_date) %>%
+  right_join(meds) %>%
+  group_by(subject_id) %>%
+  mutate(study_day = as.integer(collection_date - enroll_date)) %>%
+  # Limit to only a week before enrollment date and nothing after
+  filter(study_day > -7, collection_date <= exit_date) %>%
+  mutate(abx_yn = grepl(params$abx, abx_b)) %>%
+  mutate(reached_peak = slide_lgl(abx_yn, all, .size=1)) %>%
+  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+  ungroup()
+  
+# Manually split MIRA_024 into two sub-subjects
+subjects <- subjects %>%
+  mutate(subject_id2 = case_when(
+    subject_id != "MIRA_024" ~ subject_id,
+    study_day <= 33 ~ "MIRA_024a",
+    study_day >= 73 ~ "MIRA_024b",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(subject_id2))
+
+d2 <- left_join(subjects, d)
+```
+
+```{r}
+subjects %>% 
+  gather(key=key, value=value, abx_yn, reached_peak, on_abx) %>%
+  ggplot(aes(study_day, key)) +
+  geom_tile(aes(fill=value), color="white", size=0.5) +
+  geom_vline(aes(xintercept=0)) +
+  facet_wrap(vars(subject_id), ncol=2, scales="free_x") +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_fill_manual(values=c("TRUE"="dodgerblue", "FALSE"="lightgrey"))
+```
+
+```{r}
+d2 %>% 
+  filter(specimen_type == "Sputum" | is.na(specimen_type)) %>%
+  group_by(subject_id2) %>%
+  mutate(prop = read_count/total_reads) %>%
+  mutate(delta = prop-lag(prop)) %>%
+  ggplot(aes(study_day, color=on_abx, group=subject_id2)) +
+  geom_line(aes(y=delta)) +
+  geom_point(aes(y=delta)) +
+  geom_point(aes(y=0), shape=1) +
+  facet_wrap(vars(subject_id2), ncol=3, scales="free")
   
 ```
+
 
 ```{r shared-functions}
 run_over_specimen_types <- function(d, formula, chains=2, iter=2000, ...) {
@@ -497,33 +583,56 @@ So let's skip all that and try this again.
 ### Model 1.5.0
 
 ```{r}
-d1.5.0.sp <- d %>% filter(specimen_type == "Sputum") %>%
-  select(subject_id, specimen_id2, study_day, total_reads, read_count, abx_b) %>%
+d1.5.0.sp <- d2 %>% filter(specimen_type == "Sputum") %>%
+  select(subject_id=subject_id2, specimen_id2, study_day, total_reads, read_count, abx_yn, on_abx) %>%
   # Remove empty or single-sample subjects
   group_by(subject_id) %>%
   filter(n() > 1) %>%
   arrange(subject_id, study_day) %>%
   # Establish abx effectiveness periods:
   # 1) Translate abx to T/F
-  mutate(abx_yn = !is.na(abx_b)) %>%
+  # mutate(abx_yn = !is.na(abx_b)) %>%
   # Fill in missing sampling days
   tidyr::complete(study_day=full_seq(study_day, 1)) %>%
   # Establish window for delayed onset and delayed loss
-  mutate(on_abx = effective_window(abx_yn, lag=2, lead=3)) %>%
+  mutate(on_abx = effective_window(abx_yn, lag=0, lead=3)) %>%
   # Add lagged read and empirical proportion terms %>%
   mutate(lag_count = lag(read_count)) %>%
   mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
   # Remove missing cases 
-  filter(!is.na(lag_count) & !is.na(read_count)) %>%
+  # filter(!is.na(lag_count) & !is.na(read_count)) %>%
   ungroup() %>%
   # select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
   droplevels()
+
+d %>% group_by(subject_id) %>%
+  distinct(subject_id, study_day, abx_yn) %>%
+  arrange(subject_id, study_day) %>%
+  tidyr::complete(study_day=full_seq(study_day, 1)) %>%
+  mutate(on_abx = effective_window(abx_yn, lag=0, lead=2)) %>%
+  ggplot(aes(x=as.factor(study_day), y=subject_id, fill=abx_yn)) +
+  geom_tile(color="white")
+
+ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
+  geom_point(shape=21) +
+  geom_line() +
+  geom_vline(aes(xintercept=study_day, alpha=abx_yn)) +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
+  scale_y_continuous(labels=scales::percent) +
+  facet_wrap(~ subject_id, scales="free")
+
+```
+
+```{r}
 d1.5.0.spl <- compose_data(d1.5.0.sp)
 
 m1.5.0.sp <- stan(
   file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
   control=list(max_treedepth=15, adapt_delta=0.9))
 saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
+p1.5.0.sp <- recover_types(m1.5.0.sp, d1.5.0.sp) %>%
+  spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
+median_qi(p1.5.0.sp)
 bayesplot::mcmc_trace(extract(m1.5.0.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
 pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
@@ -532,7 +641,7 @@ pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", 
 
 ```{r}
 invisible(with(data.frame(), {
-  browser()
+  # browser()
   .m <- m1.5.0.sp
   .d <- d1.5.0.sp
   .m <- recover_types(.m, .d)
@@ -545,7 +654,6 @@ invisible(with(data.frame(), {
     stopifnot(nrow(ps) > 0)
     ps$specimen_idx <- as.integer(as.factor(ps$specimen_id2))
     cols <- n_distinct(ps$specimen_id2)
-    stopifnot(cols > 1)
     rows <- nrow(ps)/cols
     pred_prob <- matrix(data=NA, nrow=rows, ncol=cols) 
     
@@ -558,8 +666,11 @@ invisible(with(data.frame(), {
     
     pred_prob[,1] <- p.link(ps, rows, 1, .d$lag_emp_prop[1])
     
-    for (i in 2:cols) {
-      pred_prob[,i] <- p.link(ps, rows, i, pred_prob[,i-1])
+    # Skip autoregression if only one timepoint
+    if (cols > 1) {
+      for (i in 2:cols) {
+        pred_prob[,i] <- p.link(ps, rows, i, pred_prob[,i-1])
+      }
     }
     
     pred.df <- gather(data.frame(pred_prob)) %>%
@@ -579,17 +690,26 @@ invisible(with(data.frame(), {
       geom_line(alpha=0.1) +
       geom_line(data=dp, aes(y=emp_prob, group=NULL), color="red") +
       geom_vline(data=dp, aes(xintercept=study_day, alpha=on_abx), linetype=2) +
-      scale_alpha_manual(sprintf("on %s", params$abx), values=c("TRUE"=0.6, "FALSE"=0)) +
+      scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), guide=FALSE) +
       scale_y_continuous(expand=c(0,0), labels=scales::percent) +
       ggtitle(subject)
   }
   
-  pp_subject_plots <- sapply(X = as.character(unique(post$subject_id)), function(s) {
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
     print(s)
-    pp_subject(post2, s)
+    pp_subject(post2, s, T)
   })
-  
-
+  all_plots <- Reduce(`+`, pp_subject_plots)
+  plot(all_plots)
 }))
+```
+
+### Model 1.5.1
+
+Previously the lag proportions and the abx effect were additive. This next model
+has them interacting.
+
+```{r}
+
 ```
 

@@ -8,31 +8,49 @@
 #' @param specimen_fp specimen metadata table
 #' @return a phyloseq object
 load_mira_data <- function(
-  seqtab_fp="seqtab.rds", taxa_fp="taxa.rds", specimen_fp="MIRA_Specimen_Table.csv")
+  seqtab_fp="seqtab.rds", taxa_fp="taxa.rds", 
+  meds_fp="MIRA_Medications_Table.csv", specimen_fp="MIRA_Specimen_Table.csv")
 {
+  # Load sequence table
   seqtab <- readRDS(seqtab_fp)
+  # Load taxonomy table
   taxa <- readRDS(taxa_fp)
+  # Load medication table
+  meds <- readr::read_csv(meds_fp) %>%
+    mutate()
+  # Load sample metadata
   samples <- readr::read_csv(specimen_fp) %>%
     mutate_at(
-      vars(specimen_id2, specimen_id, specimen_type, subject_id, flow_cell_id), 
-      funs(factor)) %>%
-    filter(!duplicated(specimen_id2)) %>%
+      vars(
+        specimen_id2,
+        specimen_id,
+        specimen_type,
+        subject_id,
+        flow_cell_id),
+      funs(factor)
+    ) %>%
     as.data.frame()
+  # Ensure the sequence table and metadata have the same samples
   rownames(samples) <- samples$specimen_id2
   seqtab2 <- seqtab[rownames(seqtab) %in% rownames(samples),]
   samples2 <- samples[rownames(samples) %in% rownames(seqtab2),]
   seqtab3 <- seqtab[match(rownames(seqtab2), rownames(samples2)),]
   taxa2 <- taxa[match(rownames(taxa),colnames(seqtab3)), ]
-  seqs <- data.frame(seqs=rownames(taxa2), id=paste0("sv", seq_along(rownames(taxa2))))
+  # Isolate and give non-integer names to the sequence variants ("sv00001", etc)
+  seqs <- data.frame(
+    seqs=rownames(taxa2), 
+    id=paste0("sv", str_pad(seq_along(rownames(taxa2)), width = 5, pad=0)))
+  # Set this name in the corresponding tables for the variants
   rownames(taxa2) <- seqs$id
   colnames(seqtab3) <- seqs$id
   list(
     ps = phyloseq(
       otu_table(seqtab3, taxa_are_rows = FALSE),
       sample_data(samples2),
-      tax_table(taxa2)
-    ),
-    seqs = seqs
+      tax_table(taxa2)),
+    samples = as_tibble(samples),
+    seqs = as_tibble(seqs),
+    meds = as_tibble(meds)
   )
 }
 
@@ -97,12 +115,18 @@ agglomerated_to_phyloseq <- function(agg, otu_col, sample_col, count_col, ...) {
   )
 }
 
-effective_window <- function(x, lag=2, lead=3) {
+#' Calculates a "window" of effectiveness from a logical vector.
+#' It proceeds stepwise through the vector; if the vector is true at that idx,
+#' the new vector has every element from that index to that index + lag
+#' marked as true.
+#' @param lag how long the window lasts after x[i] == TRUE
+effective_window <- function(x, lag=1) {
   l <- length(x)
   x2 <- rep(FALSE, l)
-  for (i in 2:l) {
+  for (i in 1:l) {
     if (!is.na(x[i]) & x[i]) {
-      x2[seq(i+lag,i+lead)] <- TRUE
+      end = i + lag
+      x2[i:end] <- TRUE
     }
   }
   x2[1:l]

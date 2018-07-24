@@ -23,15 +23,15 @@ model{
   // Global intercept term
   mu ~ normal(-1, 1);
   // Sigma and unit normal intercepts for specimen
-  sigma_spec ~ cauchy(0, 1);
+  sigma_spec ~ exponential(1);
   a_spec_std ~ normal(0, 1);
   // Sigma and unit normal intercepts for subject
-  sigma_subj ~ cauchy(0, 1);
+  sigma_subj ~ exponential(1);
   a_subj_std ~ normal(0, 1);
   // Normal prior for lag coefficient
   b_lag ~ normal(0, 1);
   // Normal priors for abx coefficient (no pooling)
-  sigma_abx ~ cauchy(0, 1);
+  sigma_abx ~ exponential(1);
   b_abx_std ~ normal(0, 1);
   // Full model
   for (i in 1:n) {
