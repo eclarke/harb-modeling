@@ -1,0 +1,391 @@
+---
+title: "Modeling the effects of antibiotics on bacteria in the MIRA cohort"
+author: "Erik Clarke"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+params:
+  fig_fp: "figures"
+  genus: "Staphylococcus"
+  species: "aureus"
+  abx: "vancomyciniv"
+  load_saved: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup and preprocessing
+
+```{r knitr_init, cache=F, echo=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(
+  max.print="75", 
+  tibble.print_max = 35)
+opts_chunk$set(
+  echo=TRUE,
+  cache=TRUE,
+  prompt=FALSE,
+  comment=NA,
+  message=FALSE,
+  warning=FALSE,
+  results="hide")
+opts_knit$set(width=75)
+```
+
+```{r setup, cache=F, echo=TRUE}
+library(here)
+library(rethinking)
+library(tidyverse); print(packageVersion("tidyverse"))
+library(phyloseq)
+library(bayesplot)
+library(tidybayes)
+library(ggbeeswarm)
+library(magrittr)
+library(tsibble)
+library(rstan)
+library(ggridges)
+library(patchwork)
+# library(kableExtra)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+fig_fp <- params$fig_fp
+if (!dir.exists(here(fig_fp))) {
+  dir.create(here(fig_fp))
+}
+
+source(here("shared_functions.R"))
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+We first load all the data into one object. 
+This contains metadata related to each specimen, and the sequence and taxonomy table for all amplicon sequence variants (ASVs).
+
+```{r load-data}
+mira.all <- load_mira_data(
+  seqtab_fp = here("../shared/data/seqtab.rds"),
+  taxa_fp = here("../shared/data/taxa.rds"),
+  meds_fp = here("../shared/data/MIRA_Medications_Table.csv"),
+  specimen_fp = here("../shared/data/MIRA_Specimen_Table.csv")
+)
+
+seqs <- mira.all$seqs
+meds <- mira.all$meds
+```
+
+Here we filter and preprocess the data. 
+We first remove non-informative samples, merge duplicates, and restrict the data to the taxa of interest (_`r params$genus` `r params$species`_).
+Next, we calculate our "antibiotic effectiveness window" for each subject and the antibiotic of interest (`r params$abx`).
+
+```{r preprocess-data}
+mira <- mira.all$ps
+# Remove non-MIRA subjects from dataset (incl. blanks and controls)
+.nonmira <- is.na(sample_data(mira)$subject_id)
+print(sprintf("Removing %d non-MIRA samples...", sum(.nonmira)))
+mira <- prune_samples(!.nonmira, mira)
+# Remove culture samples (they break the subject/type/date unique constraint)
+.culture <- grepl("Culture", sample_data(mira)$specimen_type)
+print(sprintf("Removing %d culture samples...", sum(.culture)))
+mira <- prune_samples(!.culture, mira)
+# Remove empty samples
+.empty <- sample_sums(mira) == 0
+print(sprintf("Removing %d empty samples...", sum(.empty)))
+mira <- prune_samples(!.empty, mira)
+
+# Identify "duplicated" specimens (same subject, specimen type, and study day)
+sample_data(mira) <- sample_data(mira) %>% 
+  group_by(subject_id, specimen_type, study_day) %>%
+  # "specimen_id3" has the same value for duplicated specimens so phyloseq can 
+  # use it as a grouping level
+  mutate(specimen_id3 = case_when(
+    n() > 1 ~ paste0(first(as.character(specimen_id2)), "_D"),
+    TRUE ~ as.character(specimen_id2)
+  )) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Sum abundances and merge sample table for duplicates
+mira <- phyloseq::merge_samples(mira, "specimen_id3", fun=sum)
+# Re-add the relevant metadata since merge_samples mangles factors and dates
+sample_data(mira) <- sample_data(mira) %>% 
+  mutate(specimen_id2 = rownames(.)) %>%
+  select(specimen_id2, specimen_id3) %>%
+  left_join(mira.all$samples) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Restrict to only samples for which we have abx data
+.abx_specimens <- as.character(inner_join(sample_data(mira), meds)$specimen_id2)
+mira.abx <- prune_samples(
+  sample_data(mira)$specimen_id2 %in% .abx_specimens, mira)
+
+# Converted to melted form
+agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count")
+d <- agg %>%
+  # Calculate total reads
+  group_by(specimen_id2) %>%
+  mutate(total_reads = sum(read_count)) %>%
+  ungroup() %>%
+  # Collapse reads by genus/species
+  filter(!is.na(Genus), !is.na(Species)) %>%
+  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  summarise(read_count = sum(read_count)) %>%
+  ungroup() %>%
+  filter(Genus == params$genus) %>%
+  filter(Species == params$species) %>%
+  left_join(sample_data(mira.abx)) %>%
+  select(-c(Kingdom:Family))
+
+# Calculate antibiotic effectiveness windows
+subjects <- sample_data(mira.abx) %>%
+  group_by(subject_id) %>% 
+  mutate(exit_date = max(collection_date)) %>%
+  distinct(subject_id, enroll_date, exit_date) %>%
+  right_join(meds) %>%
+  group_by(subject_id) %>%
+  mutate(study_day = as.integer(collection_date - enroll_date)) %>%
+  mutate(exit_day = study_day[collection_date == exit_date]) %>%
+  # Limit to only a week before enrollment date and nothing after
+  filter(study_day > -3, collection_date <= exit_date) %>%
+  mutate(abx_yn = grepl(params$abx, abx_b)) %>%
+  # the .size parameter here is how long it takes to reach peak
+  # 1 = that day
+  mutate(reached_peak = slide_lgl(abx_yn, all, .size=2)) %>%
+  # the lag parameter here defines how long it lasts after end of admin.
+  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+  ungroup()
+  
+# Manually split MIRA_024 into two sub-subjects
+subjects <- subjects %>%
+  mutate(subject_id2 = case_when(
+    subject_id != "MIRA_024" ~ subject_id,
+    study_day <= 33 ~ "MIRA_024a",
+    study_day >= 73 ~ "MIRA_024b",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(subject_id2)) %>%
+  mutate(study_day = case_when(
+    subject_id2 == "MIRA_024b" ~ study_day - 73,
+    TRUE ~ as.double(study_day)
+  )) %>%
+  mutate(exit_day = ifelse(subject_id2 == "MIRA_024b", exit_day-73, exit_day))
+
+d2 <- left_join(subjects, d)
+```
+
+The following figure shows the timecourses for each subject, including the antibiotic administration periods and the days each specimen type was collected.
+
+```{r plot-timecourses, eval=T, fig.height=15, fig.width=25, echo=F}
+d2 %>% 
+  select(specimen_id2, subject_id=subject_id2, specimen_type, study_day, abx_yn, on_abx, enroll_date, exit_day, collection_date) %>%
+  spread(key=specimen_type, value=specimen_id2) %>%
+  gather(key=key, value=value, abx_yn, on_abx, Sputum, `Oral Swab`, `Stool Swab`) %>%
+  mutate(key = fct_recode(as.factor(key), "Abx. Given"="abx_yn", "Abx. Active"="on_abx")) %>%
+  mutate(value = case_when(
+    is.na(value) ~ F,
+    value == F ~ F,
+    value == T ~ T,
+    TRUE ~ T)) %>%
+  mutate(value2 = case_when(
+    value ~ as.character(key),
+    !value ~ NA_character_
+  )) %>%
+  mutate(value2 = fct_rev(as.factor(value2))) %>%
+  ggplot(aes(study_day, key)) +
+  geom_tile(aes(fill=value2), color="white", size=0.2) +
+  geom_vline(aes(xintercept=-0.5), size=0.5) +
+  geom_vline(aes(xintercept=exit_day+0.5), size=0.5) +
+  facet_wrap(vars(subject_id), ncol=2) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_fill_manual(values=c(
+    "Stool Swab"="#b15928",
+    "Oral Swab"="#ff7f00",
+    "Sputum"="#33a02c",
+    "Abx. Given"="#a6cee3",
+    "Abx. Active"="#1f78b4"), na.value="grey80") +
+    # "TRUE"="dodgerblue", "FALSE"="lightgrey")) +
+  labs(x="Study day", title=sprintf("Subject timecourses (%s)", params$abx)) +
+  coord_fixed(1) +
+  mira_theme + 
+  theme(axis.text.y=element_blank(), axis.title.y=element_blank(), axis.ticks.y=element_blank())
+```
+
+# Model v1.5 {#v1.5}
+
+We will use a binomial model of reads attributable to our bacteria of interest in a given specimen $i$ from a subject $j$ ($y_{ij}$), given the number of total reads in the specimen ($T_i$) and some probability $p_{ij}$ of seeing that bacteria: 
+$$ y_{ij} \sim \text{Binom}(T_i,\ p_{ij}) $$
+We model the probability $p_{ij}$ as a linear combination of our predictors, which are previous day's abundance of that bacteria in subject $\beta_{\text{prev}}$ and whether or not the subject is under the effects of antibiotics $\beta_{\text{abx}_j}$. In addition, we include a global intercept $\alpha_0$, a subject-specific intercept $\alpha_j$, and a specimen-specific intercept $\alpha_i$. These sub-intercepts allow the model to account for varying starting values for each subject ($\alpha_j$), and varying sequencing effort in each specimen ($\alpha_i$).
+$$ \text{logit}(p_{ij}) = \alpha_0 + \alpha_j + \alpha_i + \beta_{\text{prev}}+ \beta_{\text{abx}_j} $$
+The $\text{logit}(p_{ij})$ term in the model transforms our linear combination of predictors into a probability between 0-1 so we can use it in the binomial model above.
+
+While we don't know the values of these parameters yet (hence the model), we can describe a probability distribution for each of them that we expect will contain the true value based on our prior expectations.
+
+First, we guess that our global parameters, $\alpha_0$ and $\beta_{\text{prev}}$, come from a normal distribution centered around 0 (i.e, they could be positive or negative).
+$$ 
+\alpha_0 \sim \text{Normal}(0,\ 1) \\
+\beta_{\text{prev}} \sim \text{Normal}(0,\ 1) 
+$$
+
+The same goes for our subject-level parameters, $\alpha_j$ and $\beta_{\text{abx}_j}$. Each subject will get its own normal distribution centered at 0, but the variance parameter $\sigma$ of those distributions will be shared between subjects. This leads to partial pooling of the subject data, so that subjects with less data will be pulled towards the population median. We will model $\sigma$ with a half-Cauchy distribution, which looks like a normal distribution but allows for more extreme values and is restricted to values greater than 0.
+$$
+\alpha_j \sim \text{Normal}(0,\ \sigma_j) \\
+\sigma_j \sim \text{Half-Cauchy}(0,\ 1) \\
+\beta_{\text{abx}_j} \sim \text{Normal}(0,\ \sigma_{\text{abx}}) \\
+\sigma_{\text{abx}} \sim \text{Half-Cauchy}(0,\ 1)
+$$
+
+Finally, the specimen-level intercepts are also modeled the same way, with partial pooling. This means that the specimens with only a few reads (and hence higher uncertainty) are adjusted towards the median specimen intercept.
+$$
+\alpha_i \sim \text{Normal}(0,\ \sigma_i) \\
+\sigma_i \sim \text{Half-Cauchy}(0,\ 1) 
+$$
+
+## Model v1.5.0 {#v1-5-0}
+Straightforward implementation of the above model.
+
+To prepare the data, we restrict it to just the sputum specimens, and add variables for the previous day's proportional abundance.
+```{r}
+d1.5.0.sp <- d2 %>% filter(specimen_type == "Sputum") %>%
+  select(subject_id=subject_id2, specimen_id2, study_day, total_reads, read_count, abx_yn, on_abx) %>%
+  # Remove empty or single-sample subjects
+  group_by(subject_id) %>%
+  # filter(n() > 1) %>%
+  arrange(subject_id, study_day) %>%
+  # Add lagged read and empirical proportion terms
+  mutate(lag_count = lag(read_count)) %>%
+  mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
+  # Remove missing cases 
+  filter(!is.na(lag_count) & !is.na(read_count)) %>%
+  ungroup() %>%
+  droplevels()
+d1.5.0.spl <- compose_data(d1.5.0.sp)
+```
+
+This plot shows the data being input into the model, as proportions. Blue indicates periods when antibiotics are considered active, as determined earlier.
+
+```{r, fig.width=10, fig.height=10, echo=F, results="asis"}
+ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
+  geom_point(shape=21) +
+  geom_line() +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
+  scale_y_continuous(labels=scales::percent, expand=c(0.2,0)) +
+  scale_color_manual(values=c("TRUE"="dodgerblue", "FALSE"="grey40")) +
+  facet_wrap(~ subject_id, scales="free", ncol=3) +
+  mira_theme +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none") +
+  labs(x="Study day", y="Proportional abundance")
+```
+
+And here is a slice of the data showing just `MIRA_012`:
+```{r results="asis", fig.width=6, fig.height=3}
+.dm12 <- d1.5.0.sp %>% filter(subject_id=="MIRA_012") %>% 
+  select(subject_id, study_day, read_count, total_reads, on_abx, lag_emp_prop)
+kable(.dm12)
+ggplot(.dm12, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
+  geom_point(shape=21) +
+  geom_line() +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
+  scale_y_continuous(labels=scales::percent, expand=c(0.2,0)) +
+  scale_color_manual(values=c("TRUE"="dodgerblue", "FALSE"="grey40")) +
+  mira_theme +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none") +
+  labs(x="Study day", y="Proportional abundance")
+```
+
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_1.5.0.stan"))
+```
+
+Fitting the model:
+```{r}
+if (params$load_saved) {
+  m1.5.0.sp <- readRDS("fit_arb_1.5.0_sputum.rds")
+} else {
+  m1.5.0.sp <- stan(
+    file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.9))
+  saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
+}
+```
+
+Let's look at the posterior estimates for the global parameters, including the $\sigma$ terms:
+```{r fig.height=5, fig.width=7}
+m1.5.0.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+There is a huge amount of variance in the `sigma_subj` term, indicating a wide spread of intercepts for the various subjects, and a good indication that the subject-level intercepts were warranted. There is much less effect for the `sigma_abx` term, suggesting that the effects of antibiotics were similar between subjects.
+
+Next, let's look at the estimates for the $\beta_{\text{abx}}$ terms, which is roughly the effect of antibiotics on the abundance of the bacteria.
+
+```{r fig.height=5, fig.width=7}
+m1.5.0.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  spread_samples(b_abx[subject_id]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+Most of these estimates are centered around zero with long tails, which suggests that there is not a strong effect of antibiotics. The one real outlier is MIRA_013.
+
+The best way to understand these terms is to effectively simulate "new" timecourses from these estimates. 
+
+```{r tidy=T, fig.width=15, fig.height=10}
+invisible(with(data.frame(), {
+  # browser()
+  .m <- m1.5.0.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, sigma_spec, sigma_subj, sigma_abx, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx[subject_id])
+  post$specimen_idx <- as.integer(post$specimen_id2)
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    pp_subject_1.5.0(post2, s, .d, TRUE)
+  })
+  pp_subject_spec_plots <- Reduce(`+`, pp_subject_spec_plots)
+  plot(pp_subject_spec_plots)
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    pp_subject_1.5.0(post2, s, .d, FALSE)
+  })
+  pp_subject_plots <- Reduce(`+`, pp_subject_plots)
+  plot(pp_subject_plots)
+  
+  # Subject MIRA_012 specifically:
+  mira12 <- pp_subject_1.5.0(post2, 'MIRA_012', .d, FALSE)
+  plot(mira12)
+}))
+```
+
