@@ -249,7 +249,25 @@ $$
 $$
 
 ## Model v1.5.0 {#v1-5-0}
-Straightforward implementation of the above model.
+Straightforward implementation of the above model:
+
+```{r, echo=T}
+alist(
+  read_counts ~ dbinom(total_reads, prob),
+  logit(prob) <-  a0 + a_subj[subject] + a_spec[specimen] + b_lag*lag_prop + b_abx[subject]*on_abx,
+  # Global parameters
+  a0 ~ dnorm(0, 1),
+  b_lag ~ dnorm(0, 1),
+  # Subject-level parameters
+  a_subj[subject] ~ dnorm(0, sigma_subj),
+  sigma_subj ~ dcauchy(0, 1),
+  b_abx[subject] ~ dnorm(0, sigma_abx),
+  sigma_abx ~ dcauchy(0, 1),
+  # Specimen-level parameters
+  a_spec[specimen] ~ dnorm(0, sigma_spec),
+  sigma_spec ~ dcauchy(0, 1)
+)
+```
 
 To prepare the data, we restrict it to just the sputum specimens, and add variables for the previous day's proportional abundance.
 ```{r}

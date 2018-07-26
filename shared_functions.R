@@ -131,3 +131,56 @@ effective_window <- function(x, lag=1) {
   }
   x2[1:l]
 }
+
+
+pp_subject_1.5.0 <- function(post, subject, data, use_a_spec=F) {
+#  browser()
+  .d <- data
+  .d$specimen_idx <- as.integer(as.factor(.d$specimen_id2))
+  ps <- post %>% filter(subject_id == subject)
+  stopifnot(nrow(ps) > 0)
+  ps$specimen_idx <- as.integer(as.factor(ps$specimen_id2))
+  cols <- n_distinct(ps$specimen_id2)
+  rows <- nrow(ps)/cols
+  pred_prob <- matrix(data=NA, nrow=rows, ncol=cols) 
+  colnames(pred_prob) <- unique(ps$specimen_id2)
+  
+  p.link <- function(d, n, idx, prev_prop) {
+    d2 <- filter(d, specimen_idx == idx)
+    prob <- logistic(with(d2, mu + a_subj + a_spec*use_a_spec + b_lag * prev_prop + b_abx * on_abx))
+    rbinom(n, unique(d2$total_reads), prob)/unique(d2$total_reads)
+  }
+  
+  pred_prob[,1] <- p.link(ps, rows, 1, .d$lag_emp_prop[1])
+  
+  # Skip autoregression if only one timepoint
+  if (cols > 1) {
+    for (i in 2:cols) {
+      pred_prob[,i] <- p.link(ps, rows, i, pred_prob[,i-1])
+    }
+  }
+  
+  pred.df <- gather(data.frame(pred_prob), key = specimen_id2)
+  # levels(pred.df$key) <- levels(as.factor(ps$specimen_id2))
+
+  set.seed(12)
+  groups <- sample(1:rows, 100)
+  pred.df.sub <- group_by(pred.df, specimen_id2) %>%
+    mutate(group = seq_along(value)) %>%
+    group_by(group) %>%
+    filter(group %in% groups) %>%
+    #filter(group %in% sample(1:n_distinct(group), 150)) %>%
+    rename(pred_prob=value) %>%
+    left_join(.d) %>%
+    mutate(emp_prob = read_count/total_reads)
+  
+  dp = pred.df.sub %>% ungroup %>% distinct(specimen_id2, .keep_all = T)
+  
+  ggplot(pred.df.sub, aes(study_day, pred_prob, group=group)) +
+    geom_line(alpha=0.1) +
+    geom_line(data=dp, aes(y=emp_prob, group=NULL), color="red") +
+    geom_vline(data=dp, aes(xintercept=study_day, alpha=on_abx), linetype=2) +
+    scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), guide=FALSE) +
+    scale_y_continuous(expand=c(0,0), labels=scales::percent) +
+    ggtitle(subject)
+}

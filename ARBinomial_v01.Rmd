@@ -2,7 +2,9 @@
 title: "Hierarchical, autoregressive binomial models for MIRA 16S data"
 author: "Erik Clarke"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
-output: github_document
+output: 
+  html_document:
+    code_folding: hide
 editor_options: 
   chunk_output_type: console
 params:
@@ -10,6 +12,7 @@ params:
   genus: "Staphylococcus"
   species: "aureus"
   abx: "vancomyciniv"
+  load_saved: FALSE
 ---
 ## Setup
 
@@ -24,8 +27,12 @@ library(tidybayes)
 library(ggbeeswarm)
 library(magrittr)
 library(tsibble)
+library(knitr)
+library(kableExtra)
 rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
+options(
+  mc.cores = parallel::detectCores(),
+  tibble.print_max = 30)
 
 knitr::opts_chunk$set(
   echo = TRUE,
@@ -33,7 +40,8 @@ knitr::opts_chunk$set(
   warning=FALSE,
   message = FALSE,
   fig.width=5,
-  fig.height = 3)
+  fig.height = 3,
+  eval=FALSE)
 
 fig_fp <- params$fig_fp
 if (!dir.exists(here(fig_fp))) {
@@ -53,7 +61,7 @@ The response variable will be the raw read counts, while the treatment will be a
 `r params$abx` administration on the previous day (either that or no abx), and the previous day's read counts for 
 `r params$genus` (standardized).
 
-```{r load-data, cache=TRUE}
+```{r load-data, cache=TRUE, eval=T}
 mira.all <- load_mira_data(
   seqtab_fp = here("../shared/data/seqtab.rds"),
   taxa_fp = here("../shared/data/taxa.rds"),
@@ -133,8 +141,11 @@ subjects <- sample_data(mira.abx) %>%
   # Limit to only a week before enrollment date and nothing after
   filter(study_day > -7, collection_date <= exit_date) %>%
   mutate(abx_yn = grepl(params$abx, abx_b)) %>%
-  mutate(reached_peak = slide_lgl(abx_yn, all, .size=1)) %>%
-  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+  # the .size parameter here is how long it takes to reach peak
+  # 1 = that day
+  mutate(reached_peak = slide_lgl(abx_yn, all, .size=2)) %>%
+  # the lag parameter here defines how long it lasts after end of admin.
+  mutate(on_abx = effective_window(reached_peak, lag=0)) %>%
   ungroup()
   
 # Manually split MIRA_024 into two sub-subjects
@@ -150,7 +161,7 @@ subjects <- subjects %>%
 d2 <- left_join(subjects, d)
 ```
 
-```{r}
+```{r, eval=T, fig.width=10, fig.height=10}
 subjects %>% 
   gather(key=key, value=value, abx_yn, reached_peak, on_abx) %>%
   ggplot(aes(study_day, key)) +
@@ -161,22 +172,28 @@ subjects %>%
   scale_fill_manual(values=c("TRUE"="dodgerblue", "FALSE"="lightgrey"))
 ```
 
-```{r}
+```{r eval=T, fig.width=10, fig.height=10}
 d2 %>% 
   filter(specimen_type == "Sputum" | is.na(specimen_type)) %>%
   group_by(subject_id2) %>%
   mutate(prop = read_count/total_reads) %>%
-  mutate(delta = prop-lag(prop)) %>%
+#  mutate(delta = prop-lag(prop)) %>%
   ggplot(aes(study_day, color=on_abx, group=subject_id2)) +
-  geom_line(aes(y=delta)) +
-  geom_point(aes(y=delta)) +
-  geom_point(aes(y=0), shape=1) +
+  geom_line(aes(y=prop)) +
+  geom_point(aes(y=prop)) +
+  geom_point(aes(y=0), shape=0) +
   facet_wrap(vars(subject_id2), ncol=3, scales="free")
   
 ```
 
 
-```{r shared-functions}
+## Model 1: Binomial model with specimen and subject intercepts
+
+### Model 1.0
+
+Random intercepts for specimen and subject.
+
+```{r, results="hide"}
 run_over_specimen_types <- function(d, formula, chains=2, iter=2000, ...) {
   run_model <- function(flist, data, model, ...) {
     if (missing(flist)) {
@@ -220,17 +237,6 @@ run_over_specimen_types <- function(d, formula, chains=2, iter=2000, ...) {
   }
   models
 }
-```
-
-
-## Model 1: Binomial model with specimen and subject intercepts
-
-### Model 1.0
-
-Random intercepts for specimen and subject.
-
-```{r, results="hide"}
-
 f1.0 <- alist(
   read_count ~ dbinom(total_reads, prob),
   logit(prob) <- a_0 + a_specimen[specimen_id2] + a_subject[subject_id],
@@ -267,7 +273,7 @@ m1.1 <- stan(file="arb_1.1.stan", data=d1.1, iter=5000, warmup=1000, control=lis
 
 Same as 1.1, but now also with a binary predictor for `r params$abx`.
 
-```{r m1.2}
+```{r}
 d1.2 <- d %>% filter(
   subject_id == "MIRA_005", specimen_type=="Oral Swab") %>%
   mutate(abx_yn = !is.na(abx_b)) %>%
@@ -328,7 +334,7 @@ Alternative parameterization of the half-Cauchy
 ```
 
 
-```{r m1.2}
+```{r}
 
 writeLines(readLines("arb_1.2.1.stan"))
 
@@ -582,22 +588,19 @@ So let's skip all that and try this again.
 
 ### Model 1.5.0
 
-```{r}
+```{r eval=T, fig.width=10, fig.height=10}
 d1.5.0.sp <- d2 %>% filter(specimen_type == "Sputum") %>%
   select(subject_id=subject_id2, specimen_id2, study_day, total_reads, read_count, abx_yn, on_abx) %>%
   # Remove empty or single-sample subjects
   group_by(subject_id) %>%
   filter(n() > 1) %>%
   arrange(subject_id, study_day) %>%
-  # Fill in missing sampling days
-  # tidyr::complete(study_day=full_seq(study_day, 1)) %>%
   # Add lagged read and empirical proportion terms
   mutate(lag_count = lag(read_count)) %>%
   mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
   # Remove missing cases 
   filter(!is.na(lag_count) & !is.na(read_count)) %>%
   ungroup() %>%
-  # select(subject_id, specimen_id2, total_reads, read_count, lag_emp_prop, on_abx) %>%
   droplevels()
 
 ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
@@ -608,20 +611,39 @@ ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group
   scale_y_continuous(labels=scales::percent) +
   facet_wrap(~ subject_id, scales="free", ncol=3)
 
+d1.5.0.spl <- compose_data(d1.5.0.sp)
+```
+
+```{r, eval=T, results='asis'}
+if (params$load_saved) {
+  m1.5.0.sp <- readRDS("fit_arb_1.5.0_sputum.rds")
+} else {
+  m1.5.0.sp <- stan(
+    file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.9))
+  saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
+}
+p1.5.0.sp <- recover_types(m1.5.0.sp, d1.5.0.sp) %>%
+  spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
+median_qi(p1.5.0.sp) %>%
+  kable() %>%
+  kable_styling(bootstrap_options=c("striped", "hover", "condensed", "responsive"))
+
 ```
 
 ```{r}
-d1.5.0.spl <- compose_data(d1.5.0.sp)
-
-m1.5.0.sp <- stan(
-  file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
+m1.5.0a.sp <- stan(
+  file="arb_1.5.0a.stan", data=d1.5.0.spl, iter=2000, chains=4,
   control=list(max_treedepth=15, adapt_delta=0.9))
-saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
-p1.5.0.sp <- recover_types(m1.5.0.sp, d1.5.0.sp) %>%
-  spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
-median_qi(p1.5.0.sp)
-bayesplot::mcmc_trace(extract(m1.5.0.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+saveRDS(m1.5.0a.sp, file="fit_arb_1.5.0a_sputum.rds")
+bayesplot::mcmc_trace(rstan::extract(m1.5.0a.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
 pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
+```
+
+
+```{r}
+bayesplot::mcmc_trace(rstan::extract(m1.5.0.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+pairs(m1.5.0a.sp, pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
 
 #### Post. predictive
@@ -629,7 +651,7 @@ pairs(m1.5.0.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", 
 ```{r}
 invisible(with(data.frame(), {
   # browser()
-  .m <- m1.5.0.sp
+  .m <- m1.5.0a.sp
   .d <- d1.5.0.sp
   .m <- recover_types(.m, .d)
   post <- spread_samples(.m, mu, sigma_spec, sigma_subj, sigma_abx, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx[subject_id])
@@ -706,5 +728,39 @@ p1.5.1.sp <- recover_types(m1.5.1.sp, d1.5.0.sp) %>%
 median_qi(p1.5.1.sp)
 bayesplot::mcmc_trace(extract(m1.5.1.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
 pairs(m1.5.1.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
+```
+
+### Model 1.5.2
+
+Jason suggested coding the previous day's terms as a presence/absence variable
+for the interaction with antibiotics. This would make it simpler to understand
+the resulting coefficient as well.
+
+```{r}
+d1.5.2.sp <- d1.5.0.sp %>%
+  mutate(lag_nonzero = lag_count > 0)
+
+d1.5.2.spl <- compose_data(d1.5.2.sp)
+
+m1.5.2.sp <- stan(
+  file="arb_1.5.2.stan", data=d1.5.2.spl, iter=2000, chains=4,
+  control=list(max_treedepth=15, adapt_delta=0.9))
+saveRDS(m1.5.2.sp, file="fit_arb_1.5.2_sputum.rds")
+
+s1.5.2.sp <- summary(m1.5.2.sp)$summary %>% 
+  as.data.frame() %>% 
+  rownames_to_column("parameter") %>% 
+  as.tibble()
+
+p1.5.2.sp <- recover_types(m1.5.2.sp, d1.5.0.sp) %>%
+  spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
+median_qi(p1.5.2.sp)
+bayesplot::mcmc_trace(rstan::extract(m1.5.2.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx", "a_spec[1]", "b_lag"))
+pairs(m1.5.2.sp, pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx", "a_spec[1]", "b_lag", "b_abx[1]"))
+```
+
+
+```{r}
+
 ```
 
