@@ -133,54 +133,78 @@ effective_window <- function(x, lag=1) {
 }
 
 
-pp_subject_1.5.0 <- function(post, subject, data, use_a_spec=F) {
-#  browser()
-  .d <- data
-  .d$specimen_idx <- as.integer(as.factor(.d$specimen_id2))
-  ps <- post %>% filter(subject_id == subject)
+
+#' Generates posterior predictive time series for a subject given a link
+#' function.
+#' @param ps posterior samples from the subject
+#' @param subject the subject to simulate new posterior predictive samples
+#' @param link_function the link function to use corresponding to the model that
+#'   created `post`
+#' @param ... additional arguments to pass to `link_function`
+pp_subject <- function(ps, link_function, nsamples=150, ...) {
   stopifnot(nrow(ps) > 0)
+  subject <- unique(ps$subject_id)
+  stopifnot(length(subject)==1)
   ps$specimen_idx <- as.integer(as.factor(ps$specimen_id2))
+  dat <- ps %>%
+    ungroup() %>%
+    distinct(
+      subject_id,
+      specimen_id2,
+      specimen_idx,
+      study_day,
+      read_count,
+      total_reads,
+      on_abx,
+      lag_emp_prop
+    )
   cols <- n_distinct(ps$specimen_id2)
   rows <- nrow(ps)/cols
+  stopifnot(nsamples <= rows)
   pred_prob <- matrix(data=NA, nrow=rows, ncol=cols) 
-  colnames(pred_prob) <- unique(ps$specimen_id2)
   
-  p.link <- function(d, n, idx, prev_prop) {
-    d2 <- filter(d, specimen_idx == idx)
-    prob <- logistic(with(d2, mu + a_subj + a_spec*use_a_spec + b_lag * prev_prop + b_abx * on_abx))
-    rbinom(n, unique(d2$total_reads), prob)/unique(d2$total_reads)
-  }
-  
-  pred_prob[,1] <- p.link(ps, rows, 1, .d$lag_emp_prop[1])
+  pred_prob[,1] <- link_function(ps, rows, 1, dat$lag_emp_prop[1], ...)
   
   # Skip autoregression if only one timepoint
   if (cols > 1) {
     for (i in 2:cols) {
-      pred_prob[,i] <- p.link(ps, rows, i, pred_prob[,i-1])
+      pred_prob[,i] <- link_function(ps, rows, i, pred_prob[,i-1], ...)
     }
   }
   
-  pred.df <- gather(data.frame(pred_prob), key = specimen_id2)
-  # levels(pred.df$key) <- levels(as.factor(ps$specimen_id2))
+  pred.df <- data.frame(pred_prob, stringsAsFactors = F, check.names = F) %>%
+    gather(key = specimen_idx) %>%
+    mutate(specimen_idx=as.integer(specimen_idx))
 
-  set.seed(12)
-  groups <- sample(1:rows, 100)
-  pred.df.sub <- group_by(pred.df, specimen_id2) %>%
+  groups <- sample(1:rows, nsamples)
+  pred.df.sub <- group_by(pred.df, specimen_idx) %>%
     mutate(group = seq_along(value)) %>%
     group_by(group) %>%
     filter(group %in% groups) %>%
-    #filter(group %in% sample(1:n_distinct(group), 150)) %>%
     rename(pred_prob=value) %>%
-    left_join(.d) %>%
+    left_join(dat) %>%
     mutate(emp_prob = read_count/total_reads)
+}
+
+#' Plots posterior predictive time series for a provided subject
+#' @param subject_ppts posterior predictive time series for a subject (from e.g.
+#'   `pp_subject`)
+plot_pp_subject <- function(subject_ppts) {
+  subject <- unique(subject_ppts$subject_id)
+  stopifnot(length(subject)==1)
+  dp = subject_ppts %>% ungroup %>% distinct(specimen_id2, .keep_all = T)
   
-  dp = pred.df.sub %>% ungroup %>% distinct(specimen_id2, .keep_all = T)
-  
-  ggplot(pred.df.sub, aes(study_day, pred_prob, group=group)) +
-    geom_line(alpha=0.1) +
-    geom_line(data=dp, aes(y=emp_prob, group=NULL), color="red") +
-    geom_vline(data=dp, aes(xintercept=study_day, alpha=on_abx), linetype=2) +
-    scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), guide=FALSE) +
-    scale_y_continuous(expand=c(0,0), labels=scales::percent) +
+  p <- ggplot(subject_ppts, aes(study_day, pred_prob, group = group)) +
+    geom_vline(
+      data = dp,
+      aes(xintercept = study_day, alpha = on_abx),
+      color = "dodgerblue",
+      linetype = 3
+    ) +
+    geom_line(alpha = 0.15) +
+    geom_line(data = dp, aes(y = emp_prob, group = NULL), color = "red") +
+    scale_alpha_manual(values = c("TRUE" = 0.4, "FALSE" = 0), guide = FALSE) +
+    scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
     ggtitle(subject)
+  return(p)
 }
