@@ -704,7 +704,7 @@ saveRDS(m1.5.1.sp, file="fit_arb_1.5.1_sputum.rds")
 p1.5.1.sp <- recover_types(m1.5.1.sp, d1.5.0.sp) %>%
   spread_samples(mu, a_subj[subject_id], b_lag, b_abx[subject_id])
 median_qi(p1.5.1.sp)
-bayesplot::mcmc_trace(extract(m1.5.1.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
+bayesplot::mcmc_trace(rstan::extract(m1.5.1.sp, inc_warmup=F, permuted=F), pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag"))
 pairs(m1.5.1.sp, pars=c("mu", "sigma_spec", "sigma_subj", "a_spec[1]", "b_lag", "b_abx[1]"))
 ```
 
