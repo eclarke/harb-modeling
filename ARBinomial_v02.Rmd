@@ -180,6 +180,8 @@ subjects <- subjects %>%
   mutate(exit_day = ifelse(subject_id2 == "MIRA_024b", exit_day-73, exit_day))
 
 d2 <- left_join(subjects, d)
+
+saveRDS(d2, with(params, sprintf("_%s_%s_%s.rds", genus, species, abx)))
 ```
 
 The following figure shows the timecourses for each subject, including the antibiotic administration periods and the days each specimen type was collected.
@@ -1362,3 +1364,69 @@ invisible(with(data.frame(), {
 }))
 ```
 
+## Model v1.6.2 {#v1-6-2}
+
+While the fixed prior on the missing lag terms worked, I'm not sure it's learning from the data at all. To do that, I need to model the parameters with hyperpriors.
+
+```{r results='show'}
+writeLines(readLines("arb_1.6.2.stan"))
+```
+
+```{r}
+if (params$load_saved) {
+  m162.sp <- readRDS("fit_arb_1.6.2_sputum.rds")
+} else {
+  m162.sp <- stan(
+    file="arb_1.6.2.stan", data=d161.spl, iter=2000, chains=4,
+    control=list(max_treedepth=17, adapt_delta=0.99))
+  saveRDS(m162.sp, file="fit_arb_1.6.2_sputum.rds")
+}
+```
+
+### Diagnostics
+
+```{r}
+s162.sp <- summary(m162.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s162.sp %>% filter(Rhat >= 1.1 | n_eff < 100) %>% kable()
+```
+
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m162.sp, inc_warmup=T, permuted=F),
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "lag_mu",
+    "lag_sigma",
+    "b_lag"))
+```
+
+```{r, eval=F}
+pairs(
+  m162.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "lag_mu",
+    "lag_sigma",
+    "b_lag"))
+
+pairs(
+  m162.sp,
+  pars = c(
+    "sigma_spec",
+    "a_spec[1]",
+    "a_spec[50]",
+    "a_spec[100]",
+    "a_spec[150]",
+    "a_spec[220]"))
+```
