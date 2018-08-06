@@ -131,3 +131,80 @@ effective_window <- function(x, lag=1) {
   }
   x2[1:l]
 }
+
+
+
+#' Generates posterior predictive time series for a subject given a link
+#' function.
+#' @param ps posterior samples from the subject
+#' @param subject the subject to simulate new posterior predictive samples
+#' @param link_function the link function to use corresponding to the model that
+#'   created `post`
+#' @param ... additional arguments to pass to `link_function`
+pp_subject <- function(ps, link_function, nsamples=150, ...) {
+  stopifnot(nrow(ps) > 0)
+  subject <- unique(ps$subject_id)
+  stopifnot(length(subject)==1)
+  ps$specimen_idx <- as.integer(as.factor(ps$specimen_id2))
+  dat <- ps %>%
+    ungroup() %>%
+    distinct(
+      subject_id,
+      specimen_id2,
+      specimen_idx,
+      study_day,
+      read_count,
+      total_reads,
+      on_abx,
+      lag_emp_prop
+    )
+  cols <- n_distinct(ps$specimen_id2)
+  rows <- nrow(ps)/cols
+  stopifnot(nsamples <= rows)
+  pred_prob <- matrix(data=NA, nrow=rows, ncol=cols) 
+  
+  pred_prob[,1] <- link_function(ps, rows, 1, dat$lag_emp_prop[1], ...)
+  
+  # Skip autoregression if only one timepoint
+  if (cols > 1) {
+    for (i in 2:cols) {
+      pred_prob[,i] <- link_function(ps, rows, i, pred_prob[,i-1], ...)
+    }
+  }
+  
+  pred.df <- data.frame(pred_prob, stringsAsFactors = F, check.names = F) %>%
+    gather(key = specimen_idx) %>%
+    mutate(specimen_idx=as.integer(specimen_idx))
+
+  groups <- sample(1:rows, nsamples)
+  pred.df.sub <- group_by(pred.df, specimen_idx) %>%
+    mutate(group = seq_along(value)) %>%
+    group_by(group) %>%
+    filter(group %in% groups) %>%
+    rename(pred_prob=value) %>%
+    left_join(dat) %>%
+    mutate(emp_prob = read_count/total_reads)
+}
+
+#' Plots posterior predictive time series for a provided subject
+#' @param subject_ppts posterior predictive time series for a subject (from e.g.
+#'   `pp_subject`)
+plot_pp_subject <- function(subject_ppts) {
+  subject <- unique(subject_ppts$subject_id)
+  stopifnot(length(subject)==1)
+  dp = subject_ppts %>% ungroup %>% distinct(specimen_id2, .keep_all = T)
+  
+  p <- ggplot(subject_ppts, aes(study_day, pred_prob, group = group)) +
+    geom_vline(
+      data = dp,
+      aes(xintercept = study_day, alpha = on_abx),
+      color = "dodgerblue",
+      linetype = 3
+    ) +
+    geom_line(alpha = 0.15) +
+    geom_line(data = dp, aes(y = emp_prob, group = NULL), color = "red") +
+    scale_alpha_manual(values = c("TRUE" = 0.4, "FALSE" = 0), guide = FALSE) +
+    scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+    ggtitle(subject)
+  return(p)
+}

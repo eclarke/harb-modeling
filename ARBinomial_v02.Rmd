@@ -1,0 +1,1432 @@
+---
+title: "Modeling the effects of antibiotics on bacteria in the MIRA cohort"
+author: "Erik Clarke"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    code_folding: show
+params:
+  fig_fp: "figures"
+  genus: "Staphylococcus"
+  species: "aureus"
+  abx: "vancomyciniv"
+  load_saved: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup and preprocessing
+
+```{r knitr_init, cache=F, echo=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(
+  max.print="75", 
+  tibble.print_max = 35)
+opts_chunk$set(
+  echo=TRUE,
+  cache=TRUE,
+  prompt=FALSE,
+  comment=NA,
+  message=FALSE,
+  warning=FALSE,
+  results="hide")
+opts_knit$set(width=75)
+```
+
+```{r setup, cache=F, echo=TRUE}
+library(here)
+library(rethinking)
+library(tidyverse); print(packageVersion("tidyverse"))
+library(phyloseq)
+library(bayesplot)
+library(tidybayes)
+library(ggbeeswarm)
+library(magrittr)
+library(tsibble)
+library(rstan)
+library(ggridges)
+library(patchwork)
+# library(kableExtra)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+fig_fp <- params$fig_fp
+if (!dir.exists(here(fig_fp))) {
+  dir.create(here(fig_fp))
+}
+
+source(here("shared_functions.R"))
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+We first load all the data into one object. 
+This contains metadata related to each specimen, and the sequence and taxonomy table for all amplicon sequence variants (ASVs).
+
+```{r load-data}
+mira.all <- load_mira_data(
+  seqtab_fp = here("../shared/data/seqtab.rds"),
+  taxa_fp = here("../shared/data/taxa.rds"),
+  meds_fp = here("../shared/data/MIRA_Medications_Table.csv"),
+  specimen_fp = here("../shared/data/MIRA_Specimen_Table.csv")
+)
+
+seqs <- mira.all$seqs
+meds <- mira.all$meds
+```
+
+Here we filter and preprocess the data. 
+We first remove non-informative samples, merge duplicates, and restrict the data to the taxa of interest (_`r params$genus` `r params$species`_).
+Next, we calculate our "antibiotic effectiveness window" for each subject and the antibiotic of interest (`r params$abx`).
+
+```{r preprocess-data}
+mira <- mira.all$ps
+# Remove non-MIRA subjects from dataset (incl. blanks and controls)
+.nonmira <- is.na(sample_data(mira)$subject_id)
+print(sprintf("Removing %d non-MIRA samples...", sum(.nonmira)))
+mira <- prune_samples(!.nonmira, mira)
+# Remove culture samples (they break the subject/type/date unique constraint)
+.culture <- grepl("Culture", sample_data(mira)$specimen_type)
+print(sprintf("Removing %d culture samples...", sum(.culture)))
+mira <- prune_samples(!.culture, mira)
+# Remove empty samples
+.empty <- sample_sums(mira) == 0
+print(sprintf("Removing %d empty samples...", sum(.empty)))
+mira <- prune_samples(!.empty, mira)
+
+# Identify "duplicated" specimens (same subject, specimen type, and study day)
+sample_data(mira) <- sample_data(mira) %>% 
+  group_by(subject_id, specimen_type, study_day) %>%
+  # "specimen_id3" has the same value for duplicated specimens so phyloseq can 
+  # use it as a grouping level
+  mutate(specimen_id3 = case_when(
+    n() > 1 ~ paste0(first(as.character(specimen_id2)), "_D"),
+    TRUE ~ as.character(specimen_id2)
+  )) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Sum abundances and merge sample table for duplicates
+mira <- phyloseq::merge_samples(mira, "specimen_id3", fun=sum)
+# Re-add the relevant metadata since merge_samples mangles factors and dates
+sample_data(mira) <- sample_data(mira) %>% 
+  mutate(specimen_id2 = rownames(.)) %>%
+  select(specimen_id2, specimen_id3) %>%
+  left_join(mira.all$samples) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Restrict to only samples for which we have abx data
+.abx_specimens <- as.character(inner_join(sample_data(mira), meds)$specimen_id2)
+mira.abx <- prune_samples(
+  sample_data(mira)$specimen_id2 %in% .abx_specimens, mira)
+
+# Converted to melted form
+agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count")
+d <- agg %>%
+  # Calculate total reads
+  group_by(specimen_id2) %>%
+  mutate(total_reads = sum(read_count)) %>%
+  ungroup() %>%
+  # Collapse reads by genus/species
+  filter(!is.na(Genus), !is.na(Species)) %>%
+  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  summarise(read_count = sum(read_count)) %>%
+  ungroup() %>%
+  filter(Genus == params$genus) %>%
+  filter(Species == params$species) %>%
+  left_join(sample_data(mira.abx)) %>%
+  select(-c(Kingdom:Family))
+
+# Calculate antibiotic effectiveness windows
+subjects <- sample_data(mira.abx) %>%
+  group_by(subject_id) %>% 
+  mutate(exit_date = max(collection_date)) %>%
+  distinct(subject_id, enroll_date, exit_date) %>%
+  right_join(meds) %>%
+  group_by(subject_id) %>%
+  mutate(study_day = as.integer(collection_date - enroll_date)) %>%
+  mutate(exit_day = study_day[collection_date == exit_date]) %>%
+  # Limit to only a week before enrollment date and nothing after
+  filter(study_day > -3, collection_date <= exit_date) %>%
+  mutate(abx_yn = grepl(params$abx, abx_b)) %>%
+  # the .size parameter here is how long it takes to reach peak
+  # 1 = that day
+  mutate(reached_peak = slide_lgl(abx_yn, all, .size=2)) %>%
+  # the lag parameter here defines how long it lasts after end of admin.
+  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+  ungroup()
+  
+# Manually split MIRA_024 into two sub-subjects
+subjects <- subjects %>%
+  mutate(subject_id2 = case_when(
+    subject_id != "MIRA_024" ~ subject_id,
+    study_day <= 33 ~ "MIRA_024a",
+    study_day >= 73 ~ "MIRA_024b",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(subject_id2)) %>%
+  mutate(study_day = case_when(
+    subject_id2 == "MIRA_024b" ~ study_day - 73,
+    TRUE ~ as.double(study_day)
+  )) %>%
+  mutate(exit_day = ifelse(subject_id2 == "MIRA_024b", exit_day-73, exit_day))
+
+d2 <- left_join(subjects, d)
+
+saveRDS(d2, with(params, sprintf("_%s_%s_%s.rds", genus, species, abx)))
+```
+
+The following figure shows the timecourses for each subject, including the antibiotic administration periods and the days each specimen type was collected.
+
+```{r plot-timecourses, eval=T, fig.height=15, fig.width=25, echo=F}
+d2 %>% 
+  select(specimen_id2, subject_id=subject_id2, specimen_type, study_day, abx_yn, on_abx, enroll_date, exit_day, collection_date) %>%
+  spread(key=specimen_type, value=specimen_id2) %>%
+  gather(key=key, value=value, abx_yn, on_abx, Sputum, `Oral Swab`, `Stool Swab`) %>%
+  mutate(key = fct_recode(as.factor(key), "Abx. Given"="abx_yn", "Abx. Active"="on_abx")) %>%
+  mutate(value = case_when(
+    is.na(value) ~ F,
+    value == F ~ F,
+    value == T ~ T,
+    TRUE ~ T)) %>%
+  mutate(value2 = case_when(
+    value ~ as.character(key),
+    !value ~ NA_character_
+  )) %>%
+  mutate(value2 = fct_rev(as.factor(value2))) %>%
+  ggplot(aes(study_day, key)) +
+  geom_tile(aes(fill=value2), color="white", size=0.2) +
+  geom_vline(aes(xintercept=-0.5), size=0.5) +
+  geom_vline(aes(xintercept=exit_day+0.5), size=0.5) +
+  facet_wrap(vars(subject_id), ncol=2) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_fill_manual(values=c(
+    "Stool Swab"="#b15928",
+    "Oral Swab"="#ff7f00",
+    "Sputum"="#33a02c",
+    "Abx. Given"="#a6cee3",
+    "Abx. Active"="#1f78b4"), na.value="grey80") +
+    # "TRUE"="dodgerblue", "FALSE"="lightgrey")) +
+  labs(x="Study day", title=sprintf("Subject timecourses (%s)", params$abx)) +
+  coord_fixed(1) +
+  mira_theme + 
+  theme(axis.text.y=element_blank(), axis.title.y=element_blank(), axis.ticks.y=element_blank())
+```
+
+# Model v1.5 {#v1.5}
+
+We will use a binomial model of reads attributable to our bacteria of interest in a given specimen $i$ from a subject $j$ ($y_{ij}$), given the number of total reads in the specimen ($T_i$) and some probability $p_{ij}$ of seeing that bacteria: 
+$$ y_{ij} \sim \text{Binom}(T_i,\ p_{ij}) $$
+We model the probability $p_{ij}$ as a linear combination of our predictors, which are previous day's abundance of that bacteria in subject $\beta_{\text{prev}}p_{(i-1)j}$ and whether or not the subject is under the effects of antibiotics $\beta_{\text{abx}_j}A_{ij}$. In addition, we include a global intercept $\alpha_0$, a subject-specific intercept $\alpha_j$, and a specimen-specific intercept $\alpha_i$. These sub-intercepts allow the model to account for varying starting values for each subject ($\alpha_j$), and varying sequencing effort in each specimen ($\alpha_i$).
+$$ 
+\text{logit}(p_{ij}) = \alpha_0 + \alpha_j + \alpha_i + \beta_{\text{prev}}p_{(i-1)j}+ \beta_{\text{abx}_j}A_{ij} 
+$$
+The $\text{logit}(p_{ij})$ term in the model transforms our linear combination of predictors into a probability between 0-1 so we can use it in the binomial model above.
+
+While we don't know the values of these parameters yet (hence the model), we can describe a probability distribution for each of them that we expect will contain the true value based on our prior expectations.
+
+First, we guess that our global parameters, $\alpha_0$ and $\beta_{\text{prev}}$, come from a normal distribution centered around 0 (i.e, they could be positive or negative).
+$$ 
+\alpha_0 \sim \text{Normal}(0,\ 1) \\
+\beta_{\text{prev}} \sim \text{Normal}(0,\ 1) 
+$$
+
+The same goes for our subject-level parameters, $\alpha_j$ and $\beta_{\text{abx}_j}$. Each subject will get its own normal distribution centered at 0, but the variance parameter $\sigma$ of those distributions will be shared between subjects. This leads to partial pooling of the subject data, so that subjects with less data will be pulled towards the population median. We will model $\sigma$ with a half-Cauchy distribution, which looks like a normal distribution but allows for more extreme values and is restricted to values greater than 0.
+$$
+\alpha_j \sim \text{Normal}(0,\ \sigma_j) \\
+\sigma_j \sim \text{Half-Cauchy}(0,\ 1) \\
+\beta_{\text{abx}_j} \sim \text{Normal}(0,\ \sigma_{\text{abx}}) \\
+\sigma_{\text{abx}} \sim \text{Half-Cauchy}(0,\ 1)
+$$
+
+Finally, the specimen-level intercepts are also modeled the same way, with partial pooling. This means that the specimens with only a few reads (and hence higher uncertainty) are adjusted towards the median specimen intercept.
+$$
+\alpha_i \sim \text{Normal}(0,\ \sigma_i) \\
+\sigma_i \sim \text{Half-Cauchy}(0,\ 1) 
+$$
+
+## Model v1.5.0 {#v1-5-0}
+Straightforward implementation of the above model:
+
+```{r, echo=T}
+alist(
+  read_counts ~ dbinom(total_reads, prob),
+  logit(prob) <-  a0 + a_subj[subject] + a_spec[specimen] + b_lag*lag_prop + b_abx[subject]*on_abx,
+  # Global parameters
+  a0 ~ dnorm(0, 1),
+  b_lag ~ dnorm(0, 1),
+  # Subject-level parameters
+  a_subj[subject] ~ dnorm(0, sigma_subj),
+  sigma_subj ~ dcauchy(0, 1),
+  b_abx[subject] ~ dnorm(0, sigma_abx),
+  sigma_abx ~ dcauchy(0, 1),
+  # Specimen-level parameters
+  a_spec[specimen] ~ dnorm(0, sigma_spec),
+  sigma_spec ~ dcauchy(0, 1)
+)
+```
+
+To prepare the data, we restrict it to just the sputum specimens, and add variables for the previous day's proportional abundance.
+```{r}
+d1.5.0.sp <- d2 %>% filter(specimen_type == "Sputum") %>%
+  select(subject_id=subject_id2, specimen_id2, study_day, total_reads, read_count, abx_yn, on_abx) %>%
+  # Remove empty or single-sample subjects
+  group_by(subject_id) %>%
+  # filter(n() > 1) %>%
+  arrange(subject_id, study_day) %>%
+  # Add lagged read and empirical proportion terms
+  mutate(lag_count = lag(read_count)) %>%
+  mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
+  # Remove missing cases 
+  filter(!is.na(lag_count) & !is.na(read_count)) %>%
+  ungroup() %>%
+  droplevels()
+d1.5.0.spl <- compose_data(d1.5.0.sp)
+```
+
+This plot shows the data being input into the model, as proportions. Blue indicates periods when antibiotics are considered active, as determined earlier.
+
+```{r, fig.width=10, fig.height=10, echo=F, results="asis"}
+ggplot(d1.5.0.sp, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
+  geom_point(shape=21) +
+  geom_line() +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
+  scale_y_continuous(labels=scales::percent, expand=c(0.2,0)) +
+  scale_color_manual(values=c("TRUE"="dodgerblue", "FALSE"="grey40")) +
+  facet_wrap(~ subject_id, scales="free", ncol=3) +
+  mira_theme +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none") +
+  labs(x="Study day", y="Proportional abundance")
+```
+
+And here is a slice of the data showing just `MIRA_012`:
+```{r results="asis", fig.width=6, fig.height=3}
+.dm12 <- d1.5.0.sp %>% filter(subject_id=="MIRA_012") %>% 
+  select(subject_id, study_day, read_count, total_reads, on_abx, lag_emp_prop)
+kable(.dm12)
+ggplot(.dm12, aes(x=study_day, y=read_count/total_reads, color=on_abx, group=subject_id)) +
+  geom_point(shape=21) +
+  geom_line() +
+  scale_alpha_manual(values=c("TRUE"=0.6, "FALSE"=0), na.value=0) +
+  scale_y_continuous(labels=scales::percent, expand=c(0.2,0)) +
+  scale_color_manual(values=c("TRUE"="dodgerblue", "FALSE"="grey40")) +
+  mira_theme +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none") +
+  labs(x="Study day", y="Proportional abundance")
+```
+
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_1.5.0.stan"))
+```
+
+### Model fit
+Fitting the model:
+```{r}
+if (params$load_saved) {
+  m1.5.0.sp <- readRDS("fit_arb_1.5.0_sputum.rds")
+} else {
+  m1.5.0.sp <- stan(
+    file="arb_1.5.0.stan", data=d1.5.0.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.9))
+  saveRDS(m1.5.0.sp, file="fit_arb_1.5.0_sputum.rds")
+}
+```
+
+### Parameter estimates
+Let's look at the posterior estimates for the global parameters, including the $\sigma$ terms:
+```{r fig.height=5, fig.width=7}
+m1.5.0.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+There is a huge amount of variance in the `sigma_subj` term, indicating a wide spread of intercepts for the various subjects, and a good indication that the subject-level intercepts were warranted. There is much less effect for the `sigma_abx` term, suggesting that the effects of antibiotics were similar between subjects.
+
+Next, let's look at the estimates for the $\beta_{\text{abx}}$ terms, which is roughly the effect of antibiotics on the abundance of the bacteria.
+
+```{r fig.height=5, fig.width=7}
+m1.5.0.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  spread_samples(b_abx[subject_id]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+Most of these estimates are centered around zero with long tails, which suggests that there is not a strong effect of antibiotics. The one real outlier is MIRA_013.
+
+### Posterior predictions
+
+The best way to understand these terms is to effectively simulate "new" timecourses from these estimates. 
+
+```{r tidy=T, fig.width=15, fig.height=10}
+
+p.link150 <- function(d, n, idx, prev_prop, use_a_spec) {
+  d2 <- filter(d, specimen_idx == idx)
+  prob <- logistic(with(d2, mu + a_subj + a_spec*use_a_spec + b_lag * prev_prop + b_abx * on_abx))
+  rbinom(n, unique(d2$total_reads), prob)/unique(d2$total_reads)
+} 
+
+invisible(with(data.frame(), {
+  browser()
+  .m <- m1.5.0.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, sigma_spec, sigma_subj, sigma_abx, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx[subject_id])
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id == s)
+    subject_ppts <- pp_subject(ps, p.link150, use_a_spec=TRUE)
+    plot_pp_subject(subject_ppts)
+  })
+  pp_subject_spec_plots <- Reduce(`+`, pp_subject_spec_plots)
+  plot(pp_subject_spec_plots)
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    ps <- filter(post2, subject_id == s)
+    subject_ppts <- pp_subject(ps, p.link150, use_a_spec=FALSE)
+    plot_pp_subject(subject_ppts)
+  })
+  pp_subject_plots <- Reduce(`+`, pp_subject_plots)
+  plot(pp_subject_plots)
+  
+  # Subject MIRA_012 specifically:
+  mira12 <- filter(post2, subject_id=="MIRA_012") %>%
+    pp_subject(ps=., p.link150, use_a_spec=FALSE) %>%
+    plot_pp_subject()
+  plot(mira12)
+}))
+```
+
+## Model v1.5.1 {#v1-5-1}
+
+[skipped for now]
+
+## Model v1.5.2 {#v1-5-2}
+
+This model is reparameterized to include an interaction between the previous day's presence/absence of bacteria ($I_{(i-1)j}$) and antibiotics ($A_{ij}$).
+
+The linear term is now:
+$$
+ \text{logit}(p_{ij}) = \alpha_0 + \alpha_j + \alpha_i + \beta_{\text{prev}}p_{(i-1)j} + (\beta_{\text{abx1}_j} + \beta_{\text{abx2}_j}I_{(i-1)j})A_{ij}
+$$
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_1.5.2.stan"))
+```
+
+Fitting the model:
+```{r}
+d1.5.2.sp <- d1.5.0.sp %>%
+  mutate(lag_nonzero = lag_emp_prop > 0) %>%
+  ungroup()
+d1.5.2.spl <- compose_data(d1.5.2.sp)
+
+if (params$load_saved) {
+  m1.5.2.sp <- readRDS("fit_arb_1.5.2_sputum.rds")
+} else {
+  m1.5.2.sp <- stan(
+    file="arb_1.5.2.stan", data=d1.5.2.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.95))
+  saveRDS(m1.5.2.sp, file="fit_arb_1.5.2_sputum.rds")
+}
+```
+
+Diagnostics:
+
+- Check if any Rhat values are greater than or equal to 1.1:
+```{r}
+s152.sp <- summary(m1.5.2.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s152.sp %>% filter(Rhat >= 1.1) %>% kable()
+```
+
+The chains appear to converge relatively well:
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m1.5.2.sp, inc_warmup=T, permuted=F), 
+  pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx1", "sigma_abx2", "a_spec[1]", "b_lag"))
+```
+
+Examining the pairs plot to identify divergent transitions (this is skipped in the rendered document due to the complexity of the plot)
+```{r, eval=F}
+pairs(m1.5.2.sp, pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx1", "sigma_abx2", "a_spec[1]", "b_lag"))
+```
+
+There are quite a few divergent transitions with `adapt_delta = 0.9`. 
+If we increase it to `0.95` they decrease so I will assume that means they're 
+harmless.
+
+Global parameter estimates:
+
+```{r}
+m1.5.2.sp %>%
+  recover_types(d1.5.2.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx1, sigma_abx2) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+Antibiotic term estimates: first, the term without presence/absence:
+
+```{r fig.height=5, fig.width=7}
+m1.5.2.sp %>%
+  recover_types(d1.5.2.sp) %>%
+  spread_samples(b_abx1[subject_id]) %>%
+  ggplot(aes(x = b_abx1, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+And the interaction term (with presence/absence):
+
+```{r fig.height=5, fig.width=7}
+m1.5.2.sp %>%
+  recover_types(d1.5.2.sp) %>%
+  spread_samples(b_abx2[subject_id]) %>%
+  ggplot(aes(x = b_abx2, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+Simulating from the posterior distribution. Note: Instead of using empirical readcounts in this simulation, I'm fixing it at the approximate median of 100,000 total counts/sample. We don't need to see the technical variation repeated in here.
+
+```{r fig.width=12, fig.height=10}
+p.link152 <- function(d, n, idx, prev_prop, use_a_spec) {
+  d2 <- filter(d, specimen_idx == idx)
+  prob <- logistic(with(d2, (
+    mu + a_subj + a_spec*use_a_spec + 
+      b_lag * prev_prop + 
+      b_abx1 * on_abx + 
+      b_abx2 * on_abx * (prev_prop > 0))))
+  # rbinom(n, unique(d2$total_reads), prob)/unique(d2$total_reads)
+  rbinom(n, 1e5, prob)/1e5
+} 
+
+invisible(with(data.frame(), {
+  browser()
+  .m <- m1.5.2.sp
+  .d <- d1.5.2.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx1[subject_id], b_abx2[subject_id])
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    pp_subject(post2, s, .d, p.link152, TRUE)
+  })
+  pp_subject_spec_plots <- Reduce(`+`, pp_subject_spec_plots)
+  plot(pp_subject_spec_plots)
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    pp_subject(post2, s, .d, p.link152, FALSE)
+  })
+  pp_subject_plots <- Reduce(`+`, pp_subject_plots)
+  plot(pp_subject_plots)
+
+}))
+```
+
+One thing that's standing out to me is the wild overestimates of abundance in MIRA_015 and MIRA_033. These are two subjects that were on abx continuously but whose abundance slightly increased from 0. Thanks to the yes/no formulation of the interaction term, I think this leads to the `b_abx2` parameter to be sharply overestimated (since it just detects a change from absent to present). Thus, while the empirical abundances never rise past ~10%, the estimated abundances are as high as 80% in some trials.
+
+Counterfactual plots, where each subject is given a standard timecourse of abx, could be useful. To do this I'll generate 30 days, with 10 days off antibiotics, 10 on, and 10 off. 
+I'll also show a version where the subject-level intercepts have been set to 0 to isolate each subject's specific response to antibiotics alone.
+
+```{r fig.width=12, fig.height=10}
+invisible(with(data.frame(), {
+  # browser()
+  .m <- m1.5.2.sp
+  .d <- d1.5.2.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, b_lag,  a_subj[subject_id], b_abx1[subject_id], b_abx2[subject_id], sigma_spec)
+  # Generate 30 new samples
+  d.new <- .d %>% group_by(subject_id) %>%
+    filter(study_day == min(study_day)) %>%
+    select(subject_id, lag_emp_prop) %>% 
+    mutate(study_day = 1) %>%
+    expand(lag_emp_prop, study_day = 1:30) %>%
+    # Add abx (15 on, 15 off)
+    mutate(on_abx = c(rep(F, 10), rep(T, 10), rep(F, 10))) %>%
+    ungroup() %>%
+    mutate(specimen_id2 = seq(1:n())) %>%
+    # mutate(specimen_id2 = paste(subject_id, study_day, sep=".")) %>%
+    # Empirical read counts are irrelevant past day 1; set to constant
+    mutate(read_count = round(lag_emp_prop*1e5), total_reads = 1e5)
+  post2 <- left_join(post, d.new) %>% 
+    group_by(subject_id, study_day) %>%
+    mutate(a_spec = rnorm(n=n(), 0, sigma_spec)) %>%
+    ungroup()
+
+  post3 <- post2 %>% ungroup() %>%
+    mutate(a_subj = 0, lag_emp_prob=0.05)
+  pp_abx_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post3, subject_id == s)
+    subject_ppts <- pp_subject(ps, p.link152, F)
+    plot_pp_subject(subject_ppts)
+  })
+  pp_abx_plots <- Reduce(`+`, pp_abx_plots)
+  plot(pp_abx_plots)
+  
+}))
+```
+
+## Model v1.5.3 {#v1-5-3}
+
+Reparameterized to have a single interaction between antibiotics ($A_{ij}$) and yesterday's proportion ($p_{(i-1)j}$). 
+
+The linear term is now:
+$$
+ \text{logit}(p_{ij}) = \alpha_0 + \alpha_j + \alpha_i + \beta_{\text{prev}}p_{(i-1)j} + \beta_{\text{abx}_j}p_{(i-1)j}A_{ij}
+$$
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_1.5.3.stan"))
+```
+
+Fitting the model:
+```{r}
+if (params$load_saved) {
+  m1.5.3.sp <- readRDS("fit_arb_1.5.3_sputum.rds")
+} else {
+  m1.5.3.sp <- stan(
+    file="arb_1.5.3.stan", data=d1.5.0.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.90))
+  saveRDS(m1.5.3.sp, file="fit_arb_1.5.3_sputum.rds")
+}
+```
+
+
+
+### Diagnostic plots
+
+- Check if any Rhat values are greater than or equal to 1.1:
+```{r}
+s153.sp <- summary(m1.5.3.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s153.sp %>% filter(Rhat >= 1.1) %>% kable()
+```
+
+The chains appear to converge relatively well:
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m1.5.3.sp, inc_warmup=T, permuted=F), 
+  pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx", "a_spec[1]", "b_lag"))
+```
+
+Pairs plot (skipped in rendered document):
+```{r, eval=F}
+pairs(
+  m1.5.3.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx",
+    "a_spec[1]",
+    "b_lag"))
+```
+
+There were two divergent iterations, which I'll disregard for now. 
+
+### Parameter estimates
+
+Global terms:
+
+```{r fig.height=5, fig.width=7}
+m1.5.3.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+Antibiotic/lag interaction term:
+
+```{r fig.height=5, fig.width=7}
+m1.5.3.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  spread_samples(b_abx[subject_id]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+### Posterior predictive time series
+
+Checking to see if we can retrodict the original data, with and without the 
+specimen-level intercepts:
+
+```{r fig.width=12, fig.height=10}
+p.link153 <- function(d, n, idx, prev_prop, use_a_spec) {
+  d2 <- filter(d, specimen_idx == idx)
+  prob <- logistic(with(d2, (
+    mu + a_subj + a_spec*use_a_spec + 
+      b_lag * prev_prop + 
+      b_abx * on_abx * prev_prop)))
+  rbinom(n, 1e5, prob)/1e5
+} 
+
+invisible(with(data.frame(), {
+  .m <- m1.5.3.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx[subject_id])
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link153, use_a_spec=TRUE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_spec_plots))
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link153, use_a_spec=FALSE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_plots))
+}))
+```
+
+Next, let's simulate new timepoints for each patient as in `m1.5.2`:
+
+```{r fig.width=15, fig.height=20}
+invisible(with(data.frame(), {
+  # browser()
+  .m <- m1.5.3.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(
+    .m, mu, b_lag,  a_subj[subject_id], b_abx[subject_id], sigma_spec)
+  # Generate 30 new samples
+  d.new <- .d %>% group_by(subject_id) %>%
+    filter(study_day == min(study_day)) %>%
+    select(subject_id, lag_emp_prop) %>% 
+    mutate(study_day = 1) %>%
+    expand(lag_emp_prop, study_day = 1:30) %>%
+    # Add abx (15 on, 15 off)
+    mutate(on_abx = c(rep(F, 10), rep(T, 10), rep(F, 10))) %>%
+    ungroup() %>%
+    mutate(specimen_id2 = seq(1:n())) %>%
+    # mutate(specimen_id2 = paste(subject_id, study_day, sep=".")) %>%
+    # Empirical read counts are irrelevant past day 1; set to constant
+    mutate(read_count = round(lag_emp_prop*1e5), total_reads = 1e5)
+  post2 <- left_join(post, d.new) %>% 
+    group_by(subject_id, study_day) %>%
+    mutate(a_spec = rnorm(n=n(), 0, sigma_spec)) %>%
+    ungroup()
+
+  post3 <- post2 %>% ungroup() %>%
+    mutate(a_subj = 0, read_count=0, lag_emp_prob=0.05)
+  browser()
+  pp_abx_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post3, subject_id == s)
+    subject_ppts <- pp_subject(ps, p.link153, use_a_spec=F)
+    plot_pp_subject(subject_ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_abx_plots, ncol = 3))
+
+}))
+```
+
+From the antibiotic parameter estimates and these timecourses, it seems clear that there's only a very small effect of antibiotic*lag. 
+Most of the timecourses don't change much upon antibiotic administration, and those that do quickly grow or decrease to 100% or 0%, as expected from the prior.
+I think it'd be worthwhile to add in the standalone $b_{abx_j}$ term along with the interaction to capture the additive effect (if any).
+
+## Model v1.5.4 {#v1-5-4}
+
+Reparameterized to have an interaction between antibiotics ($A_{ij}$) and yesterday's proportion ($p_{(i-1)j}$), as well as a standalone antibiotic term. 
+
+The linear term is now:
+$$
+ \text{logit}(p_{ij}) = \alpha_0 + \alpha_j + \alpha_i + \beta_{\text{prev}}p_{(i-1)j} + \beta_{\text{abx1}_j}p_{(i-1)j}A_{ij} + \beta_{\text{abx2}_j}A_{ij}
+$$
+
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_1.5.4.stan"))
+```
+
+Fitting the model:
+```{r}
+if (params$load_saved) {
+  m1.5.4.sp <- readRDS("fit_arb_1.5.4_sputum.rds")
+} else {
+  m1.5.4.sp <- stan(
+    file="arb_1.5.4.stan", data=d1.5.0.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.90))
+  saveRDS(m1.5.4.sp, file="fit_arb_1.5.4_sputum.rds")
+}
+```
+
+### Diagnostic plots
+
+- Check if any Rhat values are greater than or equal to 1.1:
+```{r}
+s154.sp <- summary(m1.5.4.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s154.sp %>% filter(Rhat >= 1.1 | n_eff < 200) %>% kable()
+```
+
+The chains appear to converge relatively well:
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m1.5.4.sp, inc_warmup=T, permuted=F), 
+  pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx1", "sigma_abx2", "a_spec[1]", "b_lag"))
+```
+
+Pairs plot (skipped in rendered document):
+```{r, eval=F}
+pairs(
+  m1.5.4.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "b_lag"))
+
+pairs(
+  m1.5.4.sp,
+  pars = c(
+    "sigma_spec",
+    "a_spec[1]",
+    "a_spec[50]",
+    "a_spec[100]",
+    "a_spec[150]",
+    "a_spec[220]"))
+```
+
+### Sensitivity checks
+
+Part of the sensitivity checks are based on prior variance, which is undefined for Cauchy priors. I'm skipping this for now.
+
+```{r eval=F}
+m154.priorvars <- tribble( 
+  ~term, ~prior_var,
+  "mu", 1,
+  "sigma_spec", NA, # Cauchy priors have undefined variance
+  "sigma_subj", 5^2,
+  "sigma_abx1", NA,
+  "sigma_abx2", NA,
+  "b_lag", 1
+)
+m1.5.4.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx1, sigma_abx2) %>%
+  group_by(.chain, term) %>%
+  left_join(m154.priorvars) %>%
+  mutate(post_zscore=abs((estimate - mean(estimate))/sd(estimate))) %>%
+  # posterior shrinkage is 1-(post. var)/(prior var)
+  mutate(post_shrinkage=1-(var(estimate)/prior_var)) %>%
+  ggplot(aes(post_shrinkage, post_zscore)) + 
+  geom_point(alpha=0.3) +
+  facet_wrap(vars(term), scale="free")
+```
+
+
+### Parameter estimates
+
+Global terms:
+
+```{r fig.height=5, fig.width=7}
+m1.5.4.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx1, sigma_abx2) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+Antibiotic/lag interaction term:
+
+```{r fig.height=5, fig.width=7}
+m1.5.4.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  spread_samples(b_abx1[subject_id]) %>%
+  ggplot(aes(x = b_abx1, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+Antibiotic term:
+
+```{r fig.height=5, fig.width=7}
+m1.5.4.sp %>%
+  recover_types(d1.5.0.sp) %>%
+  spread_samples(b_abx2[subject_id]) %>%
+  ggplot(aes(x = b_abx2, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+### Posterior predictive time series
+
+Checking to see if we can retrodict the original data, with and without the 
+specimen-level intercepts:
+
+```{r fig.width=12, fig.height=10}
+p.link154 <- function(d, n, idx, prev_prop, use_a_spec) {
+  d2 <- filter(d, specimen_idx == idx)
+  prob <- logistic(with(d2, (
+    mu + a_subj + a_spec*use_a_spec + 
+      b_lag * prev_prop + 
+      b_abx1 * on_abx * prev_prop +
+      b_abx2 * on_abx)))
+  rbinom(n, 1e5, prob)/1e5
+} 
+
+invisible(with(data.frame(), {
+  .m <- m1.5.4.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(.m, mu, b_lag, a_spec[specimen_id2], a_subj[subject_id], b_abx1[subject_id], b_abx2[subject_id])
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count))
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link154, use_a_spec=TRUE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_spec_plots))
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link154, use_a_spec=FALSE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_plots))
+}))
+```
+
+Next, let's simulate new timepoints for each patient as in `m1.5.2`:
+
+```{r fig.width=15, fig.height=10}
+plot_pp_bands <- function(ppts) {
+  abx <- ppts %>% distinct(subject_id, study_day, on_abx) %>%
+    mutate(pred_prob = ifelse(on_abx, 0, NA)) %>%
+    filter(!is.na(pred_prob))
+  p <- ppts %>% group_by(subject_id, study_day) %>%
+    median_qi(pred_prob, .prob=c(0.5, 0.8, 0.95)) %>%
+    ggplot(aes(study_day, pred_prob)) +
+    geom_rug(data=abx, aes(color=paste0("On ", params$abx)), sides="t") +
+    geom_lineribbon(size=0.2, alpha=0.7, aes(color="Median post. prob.")) +
+    scale_fill_brewer("Probability", palette = "OrRd") +
+    scale_y_continuous(labels=scales::percent) +
+    scale_color_manual("", values = c("red", "dodgerblue")) +
+    facet_wrap(vars(subject_id), scales="free_y")
+  return(p)
+}
+
+invisible(with(data.frame(), {
+  # browser()
+  .m <- m1.5.4.sp
+  .d <- d1.5.0.sp
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(
+    .m, mu, b_lag,  a_subj[subject_id], b_abx1[subject_id], b_abx2[subject_id], sigma_spec)
+  # Generate 30 new samples
+  d.new <- .d %>% group_by(subject_id) %>%
+    filter(study_day == min(study_day)) %>%
+    select(subject_id, lag_emp_prop) %>% 
+    mutate(study_day = 1) %>%
+    expand(lag_emp_prop, study_day = 1:30) %>%
+    # Add abx (15 on, 15 off)
+    mutate(on_abx = c(rep(F, 10), rep(T, 10), rep(F, 10))) %>%
+    ungroup() %>%
+    mutate(specimen_id2 = seq(1:n())) %>%
+    # Empirical read counts are irrelevant past day 1; set to constant
+    mutate(read_count = round(lag_emp_prop*1e5), total_reads = 1e5)
+  post2 <- left_join(post, d.new) %>% 
+    group_by(subject_id, study_day) %>%
+    mutate(a_spec = rnorm(n=n(), 0, sigma_spec)) %>%
+    ungroup()
+
+  post3 <- post2 %>% ungroup() %>%
+    mutate(
+      #a_subj = 0, 
+      read_count=0, 
+      lag_emp_prob=0.05)
+  set.seed(1984)
+  pp_abx <- plyr::ddply(post3, "subject_id", function(ps) {
+    pp_subject(ps, p.link154, nsamples=500, F)
+  })
+  plot(plot_pp_bands(pp_abx))
+}))
+```
+
+# Model v1.6 {#v1-6}
+
+The model in 1.5 is actually misspecified w.r.t. its lag term- study days that occurred on Mondays have a lag proportion from the previous Friday.
+
+The missing data is specifically the proportion of bacteria on Sunday, which we can impute in Stan.
+
+## Model v1.6.0 {#v1-6-0}
+
+To test this, I'm stripping subject-level effects from the model and fitting to just one subject.
+
+### Composing data
+
+```{r}
+d160.sp.obs <- d2 %>% filter(specimen_type == "Sputum", subject_id=="MIRA_012") %>%
+  arrange(subject_id2, study_day) %>%
+  select(subject_id=subject_id2, specimen_id2, study_day, read_count, total_reads, on_abx)
+d160.sp.full <- d160.sp.obs %>%
+  group_by(subject_id) %>%
+  expand(study_day = 1:max(study_day)) %>% 
+  left_join(d160.sp.obs) %>%
+  # Add lagged empirical proportion
+  mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
+  # Remove missing cases 
+  filter(!is.na(read_count)) %>%
+  ungroup() %>%
+  droplevels()
+d160.ii_obs <- which(!is.na(d160.sp.full$lag_emp_prop))
+d160.ii_mis <- which(is.na(d160.sp.full$lag_emp_prop))
+d160.sp.obs <- d160.sp.full %>% filter(!is.na(lag_emp_prop))
+d160.sp.full <- d160.sp.full %>% select(-lag_emp_prop)
+d160.spl <- compose_data(
+  d160.sp.full,
+  lag_emp_prop_obs=d160.sp.obs$lag_emp_prop,
+  ii_obs=d160.ii_obs, 
+  n_obs=length(ii_obs),
+  ii_mis=d160.ii_mis, 
+  n_mis=length(ii_mis))
+```
+
+### Model fitting
+
+The Stan code isn't seriously more complicated. My prior for the missing probabilities will be a $\text{Beta}(2,5)$ distribution, which has more mass at low values.
+
+This is a bit problematic as the Beta distribution will never produce 0s, and for a lot of these subjects it's entirely likely the true previous probability is 0. Oh well.
+
+```{r results='show'}
+writeLines(readLines("arb_1.6.0.stan"))
+```
+
+```{r}
+if (params$load_saved) {
+  m160.sp <- readRDS("fit_arb_1.6.0_sputum.rds")
+} else {
+  m160.sp <- stan(
+    file="arb_1.6.0.stan", data=d160.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15))
+  saveRDS(m160.sp, file="fit_arb_1.6.0_sputum.rds")
+}
+```
+
+### Diagnostics
+
+```{r}
+s160.sp <- summary(m160.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s160.sp %>% filter(Rhat >= 1.1 | n_eff < 200) %>% kable()
+```
+
+Everything fits like a dream, with no divergent iterations.
+
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m160.sp, inc_warmup=T, permuted=F), 
+  pars=c("mu", "sigma_spec", "a_spec[1]", "b_lag"))
+```
+
+Pairs plot (skipped in rendered document):
+```{r, eval=F}
+pairs(
+  m160.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "a_spec[1]",
+    "b_lag"))
+
+pairs(
+  m160.sp,
+  pars = c(
+    "sigma_spec",
+    "a_spec[1]",
+    "a_spec[3]",
+    "a_spec[7]",
+    "a_spec[10]",
+    "a_spec[16]"))
+```
+
+### Parameter estimates
+
+```{r}
+m160.sp %>%
+  recover_types(d160.sp.full) %>%
+  gather_samples(mu, b_lag, sigma_spec) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+Here are the imputed lag probabilites next to the empirical probabilities (which are actually point masses, not distributions as shown here... but disregard that.)
+
+```{r fig.height=5, fig.width=7}
+m160.sp %>%
+  recover_types(d160.sp.full) %>%
+  spread_samples(lag_emp_prop[specimen_id2]) %>%
+  ggplot(aes(x = lag_emp_prop, y=fct_rev(specimen_id2), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(0,1)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Specimen", title="Antibiotic term estimates")
+```
+
+## Model v1.6.1 {#v1-6-1}
+
+Let's try fitting the full model under this imputation regime.
+
+```{r}
+d161.sp.obs <- d2 %>% filter(specimen_type == "Sputum") %>%
+  arrange(subject_id2, study_day) %>%
+  select(subject_id=subject_id2, specimen_id2, study_day, read_count, total_reads, on_abx)
+d161.sp.full <- d161.sp.obs %>%
+  group_by(subject_id) %>%
+  expand(study_day = 1:max(study_day)) %>% 
+  left_join(d161.sp.obs) %>%
+  # Add lagged empirical proportion
+  mutate(lag_emp_prop = lag(read_count)/lag(total_reads)) %>%
+  # Remove missing cases 
+  filter(!is.na(read_count)) %>%
+  ungroup() %>%
+  droplevels()
+d161.ii_obs <- which(!is.na(d161.sp.full$lag_emp_prop))
+d161.ii_mis <- which(is.na(d161.sp.full$lag_emp_prop))
+d161.sp.obs <- d161.sp.full %>% filter(!is.na(lag_emp_prop))
+d161.sp.full <- d161.sp.full %>% select(-lag_emp_prop)
+d161.spl <- compose_data(
+  d161.sp.full,
+  lag_emp_prop_obs=d161.sp.obs$lag_emp_prop,
+  ii_obs=d161.ii_obs, 
+  n_obs=length(ii_obs),
+  ii_mis=d161.ii_mis, 
+  n_mis=length(ii_mis))
+```
+
+Fully specified model in Stan:
+
+```{r results='show'}
+writeLines(readLines("arb_1.6.1.stan"))
+```
+
+```{r}
+if (params$load_saved) {
+  m161.sp <- readRDS("fit_arb_1.6.1_sputum.rds")
+} else {
+  m161.sp <- stan(
+    file="arb_1.6.1.stan", data=d161.spl, iter=2000, chains=4,
+    control=list(max_treedepth=15, adapt_delta=0.9))
+  saveRDS(m161.sp, file="fit_arb_1.6.1_sputum.rds")
+}
+```
+
+### Diagnostics
+
+```{r}
+s161.sp <- summary(m161.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s161.sp %>% filter(Rhat >= 1.1 | n_eff < 100) %>% kable()
+```
+
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m161.sp, inc_warmup=T, permuted=F), 
+  pars=c("mu", "sigma_spec", "sigma_subj", "sigma_abx1", "sigma_abx2", "a_spec[1]", "b_lag"))
+```
+
+Pairs plot (skipped in rendered document):
+```{r, eval=F}
+pairs(
+  m161.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "b_lag"))
+
+pairs(
+  m161.sp,
+  pars = c(
+    "sigma_spec",
+    "a_spec[1]",
+    "a_spec[50]",
+    "a_spec[100]",
+    "a_spec[150]",
+    "a_spec[220]"))
+```
+
+
+### Parameter estimates
+
+Global terms:
+
+```{r fig.height=5, fig.width=7}
+m161.sp %>%
+  recover_types(d161.sp.full) %>%
+  gather_samples(mu, b_lag, sigma_spec, sigma_subj, sigma_abx1, sigma_abx2) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  geom_vline(aes(xintercept=0), linetype=3) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  scale_fill_viridis_c("Probability", direction=1, alpha=0.7, option="C") +
+  scale_x_continuous(expand=c(0,0)) +
+  labs(x="Parameter estimate", y="Parameter", title="Global parameter estimates")
+```
+
+Antibiotic/lag interaction term:
+
+```{r fig.height=5, fig.width=7}
+m161.sp %>%
+  recover_types(d161.sp.full) %>%
+  spread_samples(b_abx1[subject_id]) %>%
+  ggplot(aes(x = b_abx1, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+Antibiotic term:
+
+```{r fig.height=5, fig.width=7}
+m161.sp %>%
+  recover_types(d161.sp.full) %>%
+  spread_samples(b_abx2[subject_id]) %>%
+  ggplot(aes(x = b_abx2, y=fct_rev(subject_id), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  scale_x_continuous(expand=c(0,0), limits=c(-2,2)) +
+  scale_y_discrete(expand=c(0,1.5)) +
+  labs(x="Parameter estimate", y="Subject", title="Antibiotic term estimates")
+```
+
+
+### Posterior predictive time series
+
+Checking to see if we can retrodict the original data, with and without the 
+specimen-level intercepts. We can keep the same link function as v1.5.4.
+
+```{r fig.width=12, fig.height=10}
+invisible(with(data.frame(), {
+  .m <- m161.sp
+  .d <- d161.sp.full
+  post <- recover_types(.m, .d) %>%
+    spread_samples(
+      mu, b_lag, a_spec[specimen_id2], a_subj[subject_id], 
+      b_abx1[subject_id], b_abx2[subject_id], lag_emp_prop[specimen_id2])
+  # Get point estimates for the lagged "empirical" probabilities
+  post_lag_emp_prop <- recover_types(.m, .d) %>% spread_samples(lag_emp_prop[specimen_id2]) %>%
+    summarize(lag_emp_prop=mean(lag_emp_prop))
+  post2 <- left_join(post, .d) %>% filter(!is.na(read_count)) 
+  # With specimen-specific intercepts
+  pp_subject_spec_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link154, use_a_spec=TRUE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_spec_plots))
+  
+  # Without specimen-specific intercepts
+  pp_subject_plots <- lapply(X = as.character(unique(post$subject_id)), function(s) {
+    print(s)
+    ps <- filter(post2, subject_id==s)
+    ppts <- pp_subject(ps, p.link154, use_a_spec=FALSE)
+    plot_pp_subject(ppts)
+  })
+  plot(gridExtra::arrangeGrob(grobs=pp_subject_plots))
+}))
+```
+
+```{r eval=F}
+invisible(with(data.frame(), {
+  # browser()
+  .m <- m161.sp
+  .d <- d161.sp.full
+  .m <- recover_types(.m, .d)
+  post <- spread_samples(
+    .m, mu, b_lag,  a_subj[subject_id], b_abx1[subject_id], b_abx2[subject_id], sigma_spec)
+  # Generate 30 new samples
+  d.new <- .d %>% group_by(subject_id) %>%
+    filter(study_day == min(study_day)) %>%
+    select(subject_id, lag_emp_prop) %>% 
+    mutate(study_day = 1) %>%
+    expand(lag_emp_prop, study_day = 1:30) %>%
+    # Add abx (15 on, 15 off)
+    mutate(on_abx = c(rep(F, 10), rep(T, 10), rep(F, 10))) %>%
+    ungroup() %>%
+    mutate(specimen_id2 = seq(1:n())) %>%
+    # Empirical read counts are irrelevant past day 1; set to constant
+    mutate(read_count = round(lag_emp_prop*1e5), total_reads = 1e5)
+  post2 <- left_join(post, d.new) %>% 
+    group_by(subject_id, study_day) %>%
+    mutate(a_spec = rnorm(n=n(), 0, sigma_spec)) %>%
+    ungroup()
+
+  post3 <- post2 %>% ungroup() %>%
+    mutate(
+      #a_subj = 0, 
+      read_count=0, 
+      lag_emp_prob=0.05)
+  set.seed(1984)
+  pp_abx <- plyr::ddply(post3, "subject_id", function(ps) {
+    pp_subject(ps, p.link154, nsamples=500, F)
+  })
+  plot(plot_pp_bands(pp_abx))
+}))
+```
+
+## Model v1.6.2 {#v1-6-2}
+
+While the fixed prior on the missing lag terms worked, I'm not sure it's learning from the data at all. To do that, I need to model the parameters with hyperpriors.
+
+```{r results='show'}
+writeLines(readLines("arb_1.6.2.stan"))
+```
+
+```{r}
+if (params$load_saved) {
+  m162.sp <- readRDS("fit_arb_1.6.2_sputum.rds")
+} else {
+  m162.sp <- stan(
+    file="arb_1.6.2.stan", data=d161.spl, iter=2000, chains=4,
+    control=list(max_treedepth=17, adapt_delta=0.99))
+  saveRDS(m162.sp, file="fit_arb_1.6.2_sputum.rds")
+}
+```
+
+### Diagnostics
+
+```{r}
+s162.sp <- summary(m162.sp)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s162.sp %>% filter(Rhat >= 1.1 | n_eff < 100) %>% kable()
+```
+
+```{r tidy=T}
+bayesplot::mcmc_trace(
+  rstan::extract(m162.sp, inc_warmup=T, permuted=F),
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "lag_mu",
+    "lag_sigma",
+    "b_lag"))
+```
+
+```{r, eval=F}
+pairs(
+  m162.sp,
+  pars = c(
+    "mu",
+    "sigma_spec",
+    "sigma_subj",
+    "sigma_abx1",
+    "sigma_abx2",
+    "a_spec[1]",
+    "lag_mu",
+    "lag_sigma",
+    "b_lag"))
+
+pairs(
+  m162.sp,
+  pars = c(
+    "sigma_spec",
+    "a_spec[1]",
+    "a_spec[50]",
+    "a_spec[100]",
+    "a_spec[150]",
+    "a_spec[220]"))
+```

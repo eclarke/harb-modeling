@@ -1,0 +1,138 @@
+---
+title: "Prior-day proportion imputation"
+author: "Erik Clarke"
+date: "8/2/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+params:
+  fig_fp: "figures"
+  genus: "Staphylococcus"
+  species: "aureus"
+  abx: "vancomyciniv"
+  load_saved: TRUE
+---
+
+This is a side-project to impute missing values in the dataset, specifically the previous days' proportions on days like Monday (where Sunday was not measured).
+
+# Setup
+
+```{r knitr_init, cache=F, echo=FALSE}
+library(knitr)
+
+## Global options
+options(
+  max.print="75", 
+  tibble.print_max = 35)
+opts_chunk$set(
+  echo=TRUE,
+  cache=TRUE,
+  prompt=FALSE,
+  comment=NA,
+  message=FALSE,
+  warning=FALSE,
+  results="hide")
+opts_knit$set(width=75)
+```
+
+```{r setup, cache=F, echo=TRUE}
+library(here)
+library(rethinking)
+library(tidyverse); print(packageVersion("tidyverse"))
+library(phyloseq)
+library(bayesplot)
+library(tidybayes)
+library(ggbeeswarm)
+library(magrittr)
+library(tsibble)
+library(rstan)
+library(ggridges)
+library(brms)
+library(mice)
+library(patchwork)
+# library(kableExtra)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+fig_fp <- params$fig_fp
+if (!dir.exists(here(fig_fp))) {
+  dir.create(here(fig_fp))
+}
+
+source(here("shared_functions.R"))
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+```{r load-data}
+# Create and save the RDS file in ARBinomial_v02.Rmd
+d2.location <- here(with(sprintf("_%s_%s_%s.rds", genus, species, abx)))
+stopifnot(file.exists(d2.location))
+d2 <- readRDS(d2.location)
+```
+
+# Model v1.0
+
+Basic regression with subject-level effects.
+
+## Model v1.0.0 
+
+```{r}
+d100 <- d2 %>%
+  filter(specimen_type == "Sputum") %>%
+  select(specimen_id2, subject_id2, study_day) %>%
+  group_by(subject_id2) %>%
+  filter(study_day > 0) %>%
+  expand(study_day = 1:max(study_day)) %>%
+  ungroup() %>%
+  left_join(filter(d2, specimen_type=="Sputum")) %>%
+  mutate(prop = read_count/total_reads) %>%
+  mutate(specimen_id3 = seq_along(specimen_id2)) %>%
+  select(subject_id=subject_id2, specimen_id=specimen_id3, specimen_id2, study_day, prop)
+d100l <- compose_data(
+  select(d100, -prop, specimen_id2),
+  ii_obs = which(!is.na(d100$prop)),
+  ii_mis = which(is.na(d100$prop)),
+  n_obs = length(ii_obs),
+  n_mis = length(ii_mis),
+  prop_obs = d100$prop[ii_obs]
+  )
+```
+
+Fitting the model...
+```{r}  
+mi100 <- stan("prop_imputation_1.0.stan", data=d100l)
+```
+
+### Diagnostics
+
+```{r}
+s100 <- summary(mi100)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s100 %>% filter(Rhat >= 1.1) %>% kable()
+
+bayesplot::mcmc_trace(
+  rstan::extract(mi100, inc_warmup=T, permuted=F),
+  pars=c("a0", "sigma", "sigma_subj"))
+```
+
+### Parameter estimates
+
+```{r}
+est <- mi100 %>%
+  recover_types(d100) %>%
+  spread_samples(prop[specimen_id]) %>%
+  summarize(prop.new = median(prop)) %>%
+  mutate(prop.new = ifelse(prop.new < 0, 0, prop.new)) %>%
+  left_join(d100, by=c("specimen_id"))
+
+ggplot(est, aes(study_day, prop.new, color=is.na(specimen_id2))) +
+  geom_point() +
+  facet_wrap(vars(subject_id), scales="free")
+```
+
+
+
