@@ -1,0 +1,670 @@
+---
+title: "Modeling the effects of antibiotics on bacteria in the MIRA cohort"
+author: "Erik Clarke"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    code_folding: show
+params:
+  fig_fp: "figures"
+  genus: "Staphylococcus"
+  species: "aureus"
+  load_saved: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup and preprocessing
+
+```{r knitr_init, cache=F, echo=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(
+  max.print="75", 
+  tibble.print_max = 35)
+opts_chunk$set(
+  echo=TRUE,
+  cache=TRUE,
+  prompt=FALSE,
+  comment=NA,
+  message=FALSE,
+  warning=FALSE,
+  results="hide")
+opts_knit$set(width=75)
+```
+
+```{r setup, cache=F, echo=TRUE}
+library(here)
+library(rethinking)
+library(tidyverse); print(packageVersion("tidyverse"))
+library(phyloseq)
+library(bayesplot)
+library(tidybayes)
+library(ggbeeswarm)
+library(magrittr)
+library(tsibble)
+library(rstan)
+library(ggridges)
+library(patchwork)
+# library(kableExtra)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+fig_fp <- params$fig_fp
+if (!dir.exists(here(fig_fp))) {
+  dir.create(here(fig_fp))
+}
+
+source(here("shared_functions.R"))
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+We first load all the data into one object. 
+This contains metadata related to each specimen, and the sequence and taxonomy table for all amplicon sequence variants (ASVs).
+
+```{r load-data}
+mira.all <- load_mira_data(
+  seqtab_fp = here("../shared/data/seqtab.rds"),
+  taxa_fp = here("../shared/data/taxa.rds"),
+  meds_fp = here("../shared/data/MIRA_Medications_Table.csv"),
+  specimen_fp = here("../shared/data/MIRA_Specimen_Table.csv")
+)
+
+seqs <- mira.all$seqs
+meds <- mira.all$meds
+```
+
+Here we filter and preprocess the data. 
+We first remove non-informative samples, merge duplicates, and restrict the data to the taxa of interest (_`r params$genus` `r params$species`_).
+Next, we calculate our "antibiotic effectiveness window" for each subject and the antibiotic of interest (`r params$abx`).
+
+```{r preprocess-data}
+mira <- mira.all$ps
+# Remove non-MIRA subjects from dataset (incl. blanks and controls)
+.nonmira <- is.na(sample_data(mira)$subject_id)
+print(sprintf("Removing %d non-MIRA samples...", sum(.nonmira)))
+mira <- prune_samples(!.nonmira, mira)
+# Remove culture samples (they break the subject/type/date unique constraint)
+.culture <- grepl("Culture", sample_data(mira)$specimen_type)
+print(sprintf("Removing %d culture samples...", sum(.culture)))
+mira <- prune_samples(!.culture, mira)
+# Remove empty samples
+.empty <- sample_sums(mira) == 0
+print(sprintf("Removing %d empty samples...", sum(.empty)))
+mira <- prune_samples(!.empty, mira)
+
+# Identify "duplicated" specimens (same subject, specimen type, and study day)
+sample_data(mira) <- sample_data(mira) %>% 
+  group_by(subject_id, specimen_type, study_day) %>%
+  # "specimen_id3" has the same value for duplicated specimens so phyloseq can 
+  # use it as a grouping level
+  mutate(specimen_id3 = case_when(
+    n() > 1 ~ paste0(first(as.character(specimen_id2)), "_D"),
+    TRUE ~ as.character(specimen_id2)
+  )) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Sum abundances and merge sample table for duplicates
+mira <- phyloseq::merge_samples(mira, "specimen_id3", fun=sum)
+# Re-add the relevant metadata since merge_samples mangles factors and dates
+sample_data(mira) <- sample_data(mira) %>% 
+  mutate(specimen_id2 = rownames(.)) %>%
+  select(specimen_id2, specimen_id3) %>%
+  left_join(mira.all$samples) %>%
+  ungroup() %>% as.data.frame() %>%
+  set_rownames(.$specimen_id2)
+
+# Restrict to only samples for which we have abx data
+.abx_specimens <- as.character(inner_join(sample_data(mira), meds)$specimen_id2)
+mira.abx <- prune_samples(
+  sample_data(mira)$specimen_id2 %in% .abx_specimens, mira)
+
+# Converted to melted form
+agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count")
+d <- agg %>%
+  # Calculate total reads
+  group_by(specimen_id2) %>%
+  mutate(total_reads = sum(read_count)) %>%
+  ungroup() %>%
+  # Collapse reads by genus/species
+  filter(!is.na(Genus), !is.na(Species)) %>%
+  group_by(specimen_id2, total_reads, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  summarise(read_count = sum(read_count)) %>%
+  ungroup() %>%
+  filter(Genus == params$genus) %>%
+  filter(Species == params$species) %>%
+  left_join(sample_data(mira.abx)) %>%
+  select(-c(Kingdom:Family))
+
+# Calculate antibiotic effectiveness windows
+subjects <- sample_data(mira.abx) %>%
+  group_by(subject_id) %>% 
+  mutate(exit_date = max(collection_date)) %>%
+  distinct(subject_id, enroll_date, exit_date) %>%
+  right_join(meds) %>%
+  group_by(subject_id) %>%
+  mutate(study_day = as.integer(collection_date - enroll_date)) %>%
+  mutate(exit_day = study_day[collection_date == exit_date]) %>%
+  # Limit to only a week before enrollment date and nothing after
+  filter(study_day > -3, collection_date <= exit_date) %>%
+  mutate(abx_yn = grepl(params$abx, abx_b)) %>%
+  # the .size parameter here is how long it takes to reach peak
+  # 1 = that day
+  mutate(reached_peak = slide_lgl(abx_yn, all, .size=2)) %>%
+  # the lag parameter here defines how long it lasts after end of admin.
+  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+  ungroup()
+  
+# Manually split MIRA_024 into two sub-subjects
+subjects <- subjects %>%
+  mutate(subject_id2 = case_when(
+    subject_id != "MIRA_024" ~ subject_id,
+    study_day <= 33 ~ "MIRA_024a",
+    study_day >= 73 ~ "MIRA_024b",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(subject_id2)) %>%
+  mutate(study_day = case_when(
+    subject_id2 == "MIRA_024b" ~ study_day - 73,
+    TRUE ~ as.double(study_day)
+  )) %>%
+  mutate(exit_day = ifelse(subject_id2 == "MIRA_024b", exit_day-73, exit_day))
+
+d2 <- left_join(subjects, d)
+
+saveRDS(d2, with(params, sprintf("_%s_%s_allabx.rds", genus, species)))
+```
+
+# Model v2.0 {#v2-0}
+
+The primary distinction for model 2.0 is modeling multiple antibiotics together. 
+
+## Model v2.0.0
+
+There is no time dependence or subject-specific intercepts for this first iteration of the model.
+
+The Stan code for the model:
+```{r results="show"}
+writeLines(readLines("arb_2.0.0.stan"))
+```
+
+### Fitting
+
+First, let's create dummy data using the generative process described by the model so we can see if this works at all.
+
+```{r}
+sim200.generator <- function(days_per_subject, n_subjects, n_abx, a, s_abx, b_abx) {
+  stopifnot(length(s_abx) == n_abx)
+  stopifnot(ncol(b_abx) == n_abx)
+  stopifnot(nrow(b_abx) == n_subjects)
+  
+  n_timepoints <- n_subjects * days_per_subject
+  ii_subjects <- as.vector(sapply(1:n_subjects, function(x) rep(x, days_per_subject)))
+  abx <- t(matrix(as.integer(rbernoulli(n_abx*n_timepoints)), nrow=n_abx, ncol=n_timepoints))
+  total <- rep(1000, n_timepoints)
+
+  phi <- rep(NA, n_timepoints)
+  for (i in 1:n_timepoints) {
+    phi[i] = a
+    for (j in 1:n_abx) {
+      phi[i] = phi[i] + b_abx[ii_subjects[i], j] * abx[i, j]
+    }
+  }
+  
+  # Generate and return simulated
+  reads <- rbinom(n_timepoints, total, logistic(phi))
+  data <- list(
+    n_timepoints = n_timepoints,
+    n_subjects = n_subjects,
+    n_abx = n_abx,
+    ii_subjects = ii_subjects,
+    abx = abx,
+    total = total,
+    reads = reads
+  )
+  params <- list(
+    a = a,
+    s_abx = s_abx,
+    b_abx = b_abx
+  )
+  list(data=data, params=params)
+}
+
+dsim200 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 1
+  s_abx <- rexp(n_abx, 1)
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  sim200.generator(10, n_subjects, n_abx, a, s_abx, b_abx)
+})
+```
+
+Fit the model:
+
+```{r}
+m200 <- stan(
+  file="arb_2.0.0.stan", data=dsim200$data, cores=4, 
+  control=list(max_treedepth=12, adapt_delta=0.9))
+```
+
+### Diagnostics
+
+Check a few of the chains:
+```{r}
+bayesplot::mcmc_trace(
+  rstan::extract(m200, inc_warmup=T, permuted=F), 
+  pars=c("a", "b_abx[1,1]", "s_abx[1]"))
+```
+
+### Concordance
+
+How well do the predicted values match up with the true values?
+
+```{r fig.height=5, fig.width=7}
+m200 %>%
+  spread_samples(a, b_abx[subject, abx], s_abx[abx]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  facet_wrap(vars(abx), scales="free")
+```
+
+One thing I noticed here is that large values of `s_abx`, resulting in wide magnitude ranges of `b_abx`, tend to get compressed by the transformation to the unit scale by the 'logistic' function. 
+When this happens, we are unable to correctly recaptulate the values of `s_abx` and `b_abx` as they have gotten "lost in the extremes" and aren't recoverable from the data (i.e. the probabilities in the binomial process just go to 1 or 0).
+
+During the generative process, I had the administration days (the `abx` matrix) following a set pattern of abx co-administration. 
+This resulted in the inability to retrieve the `b_abx` values, I think due to collinearity. 
+It suggests that I should find a diagnostic for collinearity that I can use on real-world data. 
+Once I switched the generative process to effectively randomize administration days with a yes/no value of 0.5, it retrieved the `b_abx` values nearly perfectly.
+
+## Model v2.0.1
+
+Here we will add subject-specific intercepts.
+
+```{r results="show"}
+writeLines(readLines("arb_2.0.1.stan"))
+```
+
+### Fitting
+
+Again, create simulated data to test model integrity.
+
+```{r}
+sim201.generator <- function(days_per_subject, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx) {
+  stopifnot(length(a_subj) == n_subjects)
+  stopifnot(length(s_abx) == n_abx)
+  stopifnot(ncol(b_abx) == n_abx)
+  stopifnot(nrow(b_abx) == n_subjects)
+  
+  n_timepoints <- n_subjects * days_per_subject
+  ii_subjects <- as.vector(sapply(1:n_subjects, function(x) rep(x, days_per_subject)))
+  abx <- t(matrix(as.integer(rbernoulli(n_abx*n_timepoints)), nrow=n_abx, ncol=n_timepoints))
+  total <- rep(1000, n_timepoints)
+
+  phi <- rep(NA, n_timepoints)
+  for (i in 1:n_timepoints) {
+    phi[i] = a + a_subj[ii_subjects[i]]
+    for (j in 1:n_abx) {
+      phi[i] = phi[i] + b_abx[ii_subjects[i], j] * abx[i, j]
+    }
+  }
+  
+  # Generate and return simulated
+  reads <- rbinom(n_timepoints, total, logistic(phi))
+  data <- list(
+    n_timepoints = n_timepoints,
+    n_subjects = n_subjects,
+    n_abx = n_abx,
+    ii_subjects = ii_subjects,
+    abx = abx,
+    total = total,
+    reads = reads
+  )
+  params <- list(
+    a = a,
+    a_subj = a_subj,
+    s_subj = s_subj,
+    s_abx = s_abx,
+    b_abx = b_abx
+  )
+  list(data=data, params=params)
+}
+
+dsim201 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 1
+  s_abx <- rexp(n_abx, 1)
+  s_subj <- rexp(1, 1)
+  a_subj <- rnorm(n_subjects, 0, s_subj);
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  sim201.generator(10, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx)
+})
+```
+
+
+Fit the model:
+
+```{r}
+m201 <- stan(
+  file="arb_2.0.1.stan", data=dsim201$data, cores=4, 
+  control=list(max_treedepth=12, adapt_delta=0.9))
+```
+
+### Diagnostics
+
+Check a few of the chains:
+```{r}
+bayesplot::mcmc_trace(
+  rstan::extract(m201, inc_warmup=T, permuted=F), 
+  pars=c("a", "b_abx[1,1]", "s_abx[1]"))
+```
+
+### Concordance
+
+How well do the predicted values match up with the true values?
+
+```{r fig.height=5, fig.width=7}
+m201 %>%
+  spread_samples(a, b_abx[subject, abx], s_abx[abx]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  facet_wrap(vars(abx), scales="free")
+```
+
+```{r}
+m201 %>% 
+  spread_samples(a, a_subj[subject]) %>%
+  ggplot(aes(x = a_subj, y=fct_rev(as.factor(subject)))) +
+  tidybayes::stat_intervalh()
+```
+
+This model also successfully recapitulates the true parameter values.
+
+## Model v2.0.2
+
+Let's add back the time dependence, both with a separate `b_lag` term as well as multipliers on the antibiotic terms.
+
+
+```{r results="show"}
+writeLines(readLines("arb_2.0.2.stan"))
+```
+
+### Fitting
+
+Again, create simulated data to test model integrity.
+
+```{r}
+sim202.generator <- function(days_per_subject, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx, b_lag) {
+  stopifnot(length(a_subj) == n_subjects)
+  stopifnot(length(s_abx) == n_abx)
+  stopifnot(ncol(b_abx) == n_abx)
+  stopifnot(nrow(b_abx) == n_subjects)
+  
+  n_timepoints <- n_subjects * days_per_subject
+  ii_subjects <- as.vector(sapply(1:n_subjects, function(x) rep(x, days_per_subject)))
+  abx <- t(matrix(as.integer(rbernoulli(n_abx*n_timepoints, p=0.2)), nrow=n_abx, ncol=n_timepoints))
+  total <- rep(1000, n_timepoints)
+
+  phi <- rep(NA, n_timepoints)
+  prev <- rep(0.5, n_timepoints)
+  reads <- rep(NA, n_timepoints)
+  prev <- rep(NA, n_timepoints)
+  prev[c(1, c(1:n_subjects)*days_per_subject)] <- 0.5
+  
+  for (i in 1:n_timepoints) {
+    if (is.na(prev[i])) {
+      prev[i] <- reads[i-1]/total[i-1]
+    }
+    phi[i] <- a + a_subj[ii_subjects[i]] + b_lag * prev[i]
+    for (j in 1:n_abx) {
+      phi[i] <- phi[i] + b_abx[ii_subjects[i], j] * abx[i, j] * prev[i]
+    }
+    reads[i] <- rbinom(1, total[i], logistic(phi[i]))
+  }
+  
+  data <- list(
+    n_timepoints = n_timepoints,
+    n_subjects = n_subjects,
+    n_abx = n_abx,
+    ii_subjects = ii_subjects,
+    abx = abx,
+    total = total,
+    reads = reads,
+    prev = prev
+  )
+  
+  params <- list(
+    a = a,
+    a_subj = a_subj,
+    s_subj = s_subj,
+    s_abx = s_abx,
+    b_lag = b_lag,
+    b_abx = b_abx
+  )
+  list(data=data, params=params)
+}
+set.seed(16)
+dsim202 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 0.2
+  s_abx <- rexp(n_abx, 1)
+  s_subj <- rexp(1, 1)
+  a_subj <- rnorm(n_subjects, 0, s_subj);
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  b_lag <- 0.5
+  sim202.generator(20, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx, b_lag)
+})
+```
+
+Fit the model:
+
+```{r}
+m202 <- stan(
+  file="arb_2.0.2.stan", data=dsim202$data, cores=4, 
+  control=list(max_treedepth=12, adapt_delta=0.9))
+```
+
+There were no errors or warnings fitting the model.
+
+### Concordance
+```{r}
+m202 %>% 
+  spread_samples(a, b_lag, a_subj[subject]) %>%
+  median_qi()
+  ggplot(aes(x = a_subj, y=fct_rev(as.factor(subject)))) +
+  tidybayes::stat_intervalh()
+```
+
+```{r} 
+m202 %>%
+  spread_samples(a, b_abx[subject, abx], s_abx[abx]) %>%
+  ggplot(aes(x = b_abx, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1.5) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  facet_wrap(vars(abx), scales="free")
+```
+
+This model successfully recapitulates the given parameters as well.
+
+## Model 2.0.3
+
+In model 1.5.4, we had two antibiotics terms- the first was an interaction with the presence/absence of the abx and the proportion of bacteria, while the second was just presence/absence of abx. 
+This helped capture the potentially positive effect of the antibiotic (e.g. increased chance of seeing the bacteria) even if the bacteria was not detected previously.
+
+```{r results="show"}
+writeLines(readLines("arb_2.0.2.stan"))
+```
+
+### Fitting
+
+Again, create simulated data to test model integrity.
+
+```{r}
+sim203.generator <- function(
+  days_per_subject, n_subjects, n_abx, 
+  a, a_subj, s_subj, 
+  s_abx, b_abx, 
+  s_abxp, b_abxp,
+  b_lag) 
+{
+  stopifnot(length(a_subj) == n_subjects)
+  stopifnot(length(s_abx) == n_abx)
+  stopifnot(length(s_abxp) == n_abx)
+  stopifnot(ncol(b_abx) == n_abx)
+  stopifnot(nrow(b_abx) == n_subjects)
+  stopifnot(nrow(b_abxp) == n_subjects)
+  
+  n_timepoints <- n_subjects * days_per_subject
+  ii_subjects <- as.vector(sapply(1:n_subjects, function(x) rep(x, days_per_subject)))
+  abx <- t(matrix(as.integer(rbernoulli(n_abx*n_timepoints)), nrow=n_abx, ncol=n_timepoints))
+  total <- rep(1000, n_timepoints)
+
+  phi <- rep(NA, n_timepoints)
+  prev <- rep(0.5, n_timepoints)
+  reads <- rep(NA, n_timepoints)
+  prev <- rep(NA, n_timepoints)
+  prev[c(1, c(1:n_subjects)*days_per_subject)] <- 0.5
+  
+  for (i in 1:n_timepoints) {
+    if (is.na(prev[i])) {
+      prev[i] <- reads[i-1]/total[i-1]
+    }
+    phi[i] <- a + a_subj[ii_subjects[i]] + b_lag * prev[i]
+    for (j in 1:n_abx) {
+      phi[i] <- (
+        phi[i] + 
+          b_abxp[ii_subjects[i], j] * abx[i, j] * prev[i] + 
+          b_abx[ii_subjects[i], j] * abx[i,j]
+      )
+    }
+    reads[i] <- rbinom(1, total[i], logistic(phi[i]))
+  }
+  
+  data <- list(
+    n_timepoints = n_timepoints,
+    n_subjects = n_subjects,
+    n_abx = n_abx,
+    ii_subjects = ii_subjects,
+    abx = abx,
+    total = total,
+    reads = reads,
+    prev = prev
+  )
+  
+  params <- list(
+    a = a,
+    a_subj = a_subj,
+    s_subj = s_subj,
+    s_abx = s_abx,
+    s_abxp = s_abxp,
+    b_lag = b_lag,
+    b_abx = b_abx,
+    b_abxp = b_abxp
+  )
+  list(data=data, params=params)
+}
+set.seed(32)
+dsim203 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 0.2
+  s_abx <- rexp(n_abx, 1)
+  s_abxp <- rexp(n_abx, 1)
+  s_subj <- rexp(1, 1)
+  a_subj <- rnorm(n_subjects, 0, s_subj);
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  b_abxp <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abxp), nrow=n_abx, ncol=n_subjects))
+  b_lag <- 0.5
+  sim203.generator(10, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx, s_abxp, b_abxp, b_lag)
+})
+```
+
+Fit the model:
+
+```{r}
+m203 <- stan(
+  file="arb_2.0.3.stan", data=dsim203$data, cores=4, 
+  control=list(max_treedepth=15, adapt_delta=0.99))
+```
+
+There were no errors or warnings fitting the model.
+
+### Concordance
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abx <- reshape2::melt(dsim203$params$b_abx, varnames=c("subject", "abx"))
+  p <- m203 %>%
+    spread_samples(b_abx[subject, abx]) %>%
+    ggplot(aes(x = b_abx, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abx, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abx'")
+  plot(p)
+}))
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abxp <- reshape2::melt(dsim203$params$b_abxp, varnames=c("subject", "abx"))
+  p <- m203 %>%
+    spread_samples(b_abxp[subject, abx]) %>%
+    ggplot(aes(x = b_abxp, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abxp, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abxp'")
+  plot(p)
+}))
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_a_subj <- data.frame(value=dsim203$params$a_subj)
+  true_a_subj$subject <- 1:nrow(true_a_subj)
+  p <- m203 %>%
+    spread_samples(a_subj[subject]) %>%
+    ggplot(aes(x = a_subj, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_a_subj, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    ggtitle("Estimates vs true values of 'a_subj'")
+  plot(p)
+}))
+```
+
+In some situations the parameters are close but it doesn't consistently reproduce the true values.
+I thought it might be due to the two parameters but if I remove one of them it doesn't recapitulate them any better.
+Especially problematic are the subject-specific intercepts, which is likely due to the partial pooling.
+If I make them completely independent, I can recapture the true parameters.
+
+This strongly suggests to me that the partial pooling is drawing the estimated values away from the true values in some cases.
+
+
