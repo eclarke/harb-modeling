@@ -69,7 +69,7 @@ theme_set(mira_theme)
 
 ```{r load-data}
 # Create and save the RDS file in ARBinomial_v02.Rmd
-d2.location <- here(with(sprintf("_%s_%s_%s.rds", genus, species, abx)))
+d2.location <- here(with(params, sprintf("_%s_%s_%s.rds", genus, species, abx)))
 stopifnot(file.exists(d2.location))
 d2 <- readRDS(d2.location)
 ```

@@ -144,7 +144,7 @@ d <- agg %>%
   left_join(sample_data(mira.abx)) %>%
   select(-c(Kingdom:Family))
 
-# Calculate antibiotic effectiveness windows
+# Clean up subject/timepoint data
 subjects <- sample_data(mira.abx) %>%
   group_by(subject_id) %>% 
   mutate(exit_date = max(collection_date)) %>%
@@ -154,15 +154,8 @@ subjects <- sample_data(mira.abx) %>%
   mutate(study_day = as.integer(collection_date - enroll_date)) %>%
   mutate(exit_day = study_day[collection_date == exit_date]) %>%
   # Limit to only a week before enrollment date and nothing after
-  filter(study_day > -3, collection_date <= exit_date) %>%
-  mutate(abx_yn = grepl(params$abx, abx_b)) %>%
-  # the .size parameter here is how long it takes to reach peak
-  # 1 = that day
-  mutate(reached_peak = slide_lgl(abx_yn, all, .size=2)) %>%
-  # the lag parameter here defines how long it lasts after end of admin.
-  mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
-  ungroup()
-  
+  filter(study_day > -3, collection_date <= exit_date)
+
 # Manually split MIRA_024 into two sub-subjects
 subjects <- subjects %>%
   mutate(subject_id2 = case_when(
@@ -178,7 +171,52 @@ subjects <- subjects %>%
   )) %>%
   mutate(exit_day = ifelse(subject_id2 == "MIRA_024b", exit_day-73, exit_day))
 
-d2 <- left_join(subjects, d)
+# Clean up antibiotics data
+subjects_abx <- subjects %>%
+  ungroup() %>%
+  separate_rows(abx_b) %>%
+  # Handle coformulations
+  mutate(abx_b2 = case_when(
+    abx_b == "clavulanate" ~ "amoxicillin.clavulanate",
+    abx_b == "sulbactam" ~ "ampicillin.sulbactam",
+    abx_b == "tazobactam" ~ "piperacillin.tazobactam",
+    abx_b == "trimethoprim" ~ "trimethoprim.sulfamethoxazole",
+    TRUE ~ abx_b)) %>%
+  group_by(subject_id, collection_date) %>%
+  # Remove remaining part of coformulation if coformulation is present
+  filter(
+    (abx_b2 != "amoxicillin" & ("amoxicillin.clavulanate" %in% abx_b2)) | 
+    !("amoxicillin.clavulanate" %in% abx_b2) |
+    is.na(abx_b2)
+  ) %>%
+  filter(
+    (abx_b2 != "ampicillin" & ("ampicillin.sulbactam" %in% abx_b2)) |
+    !("ampicillin.sulbactam" %in% abx_b2) |
+    is.na(abx_b2)
+  ) %>%
+  filter(
+    (abx_b2 != "sulfamethoxazole" & ("trimethoprim.sulfamethoxazole" %in% abx_b2)) |
+    !("trimethoprim.sulfamethoxazole" %in% abx_b2) |
+    is.na(abx_b2)
+  ) %>%
+  ungroup() %>%
+  filter((abx_b2 != "piperacillin") | is.na(abx_b2)) %>%
+  mutate(abx_b = abx_b2) %>%
+  select(-abx_b2) %>%
+  mutate(abx_idx = as.numeric(as.factor(abx_b))) %>%
+  mutate(abx_yn = ifelse(is.na(abx_b), 0, 1))
+
+## RETURN TO THIS LATER: ABX EFFECTIVENESS WINDOWS
+# subjects %>%
+#   mutate(abx_yn = grepl(params$abx, abx_b)) %>%
+#   # the .size parameter here is how long it takes to reach peak
+#   # 1 = that day
+#   mutate(reached_peak = slide_lgl(abx_yn, all, .size=1)) %>%
+#   # the lag parameter here defines how long it lasts after end of admin.
+#   mutate(on_abx = effective_window(reached_peak, lag=1)) %>%
+#   ungroup()
+  
+d2 <- left_join(subjects_abx, d)
 
 saveRDS(d2, with(params, sprintf("_%s_%s_allabx.rds", genus, species)))
 ```
@@ -507,7 +545,7 @@ In model 1.5.4, we had two antibiotics terms- the first was an interaction with 
 This helped capture the potentially positive effect of the antibiotic (e.g. increased chance of seeing the bacteria) even if the bacteria was not detected previously.
 
 ```{r results="show"}
-writeLines(readLines("arb_2.0.2.stan"))
+writeLines(readLines("arb_2.0.3.stan"))
 ```
 
 ### Fitting
@@ -667,4 +705,338 @@ If I make them completely independent, I can recapture the true parameters.
 
 This strongly suggests to me that the partial pooling is drawing the estimated values away from the true values in some cases.
 
+What features are missing?
 
+- specimen-specific intercepts
+
+## Model v2.0.4
+
+In which we fit specimen-specific intercepts to model overdispersion.
+
+```{r results="show"}
+writeLines(readLines("arb_2.0.4.stan"))
+```
+
+### Fitting
+
+We won't simulate new data for this, but instead fit to our previous data.
+
+```{r}
+m204 <- stan(
+  file="arb_2.0.4.stan", data=dsim203$data, cores=4, 
+  control=list(max_treedepth=15, adapt_delta=0.99))
+```
+
+### Diagnostics
+
+```{r}
+s204 <- summary(m204)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s204 %>% filter(Rhat >= 1.1 | n_eff < 200) %>% kable()
+```
+
+```{r}
+pairs(
+  m204,
+  pars = c(
+    "a",
+    "s_spec_nc",
+    "a_spec[1]",
+    "s_subj_nc",
+    "a_subj_nc",
+    "lp__"))
+```
+
+### Concordance
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abx <- reshape2::melt(dsim203$params$b_abx, varnames=c("subject", "abx"))
+  p <- m204 %>%
+    spread_samples(b_abx[subject, abx]) %>%
+    ggplot(aes(x = b_abx, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abx, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abx'")
+  plot(p)
+}))
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abxp <- reshape2::melt(dsim203$params$b_abxp, varnames=c("subject", "abx"))
+  p <- m204 %>%
+    spread_samples(b_abxp[subject, abx]) %>%
+    ggplot(aes(x = b_abxp, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abxp, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abxp'")
+  plot(p)
+}))
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_a_subj <- data.frame(value=dsim203$params$a_subj)
+  true_a_subj$subject <- 1:nrow(true_a_subj)
+  p <- m204 %>%
+    spread_samples(a_subj[subject]) %>%
+    ggplot(aes(x = a_subj, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_a_subj, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    ggtitle("Estimates vs true values of 'a_subj'")
+  plot(p)
+}))
+```
+
+The addition of specimen intercepts does not appear to seriously change the estimates of the other parameters, which is good.
+It was necessary to reformulate the `a_spec` parameter to non-centered parameterization for efficient fitting (and even then I encountered 2 divergent transitions).
+I had to move both `a_spec` and `a_subj` to NCP to eliminate divergences entirely.
+
+## Model v2.0.5
+
+The last concern to address is situations where we're modeling a `b_abx` combo for a subject that never got that antibiotic, ever.
+
+The question is whether estimating these `b_abx` terms impedes identifiability for the other `b_abx` terms for which we do have data.
+If it doesn't, then these are basically harmless and can be ignored.
+If these 'nonexistent' `b_abx` terms affect the others, we need to find a way to "remove" them from consideration.
+
+One of the things we could do is assign different priors to those terms: instead of having a shared variance/intercept term (partial pooling), these are on their own, i.e. not multiplied by `s_abx_nc`. 
+
+First, let's see what happens when we simulate a patient that never got an antibiotic:
+
+```{r}
+sim205.generator <- function(
+  days_per_subject, n_subjects, n_abx, 
+  a, a_subj, s_subj, 
+  s_abx, b_abx, 
+  s_abxp, b_abxp,
+  b_lag, zero_subject_1=T) 
+{
+  stopifnot(length(a_subj) == n_subjects)
+  stopifnot(length(s_abx) == n_abx)
+  stopifnot(length(s_abxp) == n_abx)
+  stopifnot(ncol(b_abx) == n_abx)
+  stopifnot(nrow(b_abx) == n_subjects)
+  stopifnot(nrow(b_abxp) == n_subjects)
+  
+  n_timepoints <- n_subjects * days_per_subject
+  ii_subjects <- as.vector(sapply(1:n_subjects, function(x) rep(x, days_per_subject)))
+  abx <- t(matrix(as.integer(rbernoulli(n_abx*n_timepoints)), nrow=n_abx, ncol=n_timepoints))
+  # Zero out one subject's administration of an single abx entirely (subject 1, abx 1)
+  if (zero_subject_1) {
+    abx[(1:days_per_subject), 1] <- 0    
+  }
+
+  total <- rep(1000, n_timepoints)
+
+  phi <- rep(NA, n_timepoints)
+  prev <- rep(0.5, n_timepoints)
+  reads <- rep(NA, n_timepoints)
+  prev <- rep(NA, n_timepoints)
+  prev[c(1, c(1:n_subjects)*days_per_subject)] <- 0.5    
+
+  set.seed(2000)
+  for (i in 1:n_timepoints) {
+    if (is.na(prev[i])) {
+      prev[i] <- reads[i-1]/total[i-1]
+    }
+    phi[i] <- a + a_subj[ii_subjects[i]] + b_lag * prev[i]
+    for (j in 1:n_abx) {
+      phi[i] <- (
+        phi[i] + 
+          b_abxp[ii_subjects[i], j] * abx[i, j] * prev[i] + 
+          b_abx[ii_subjects[i], j] * abx[i,j]
+      )
+    }
+    reads[i] <- rbinom(1, total[i], logistic(phi[i]))
+  }
+  
+  data <- list(
+    n_timepoints = n_timepoints,
+    n_subjects = n_subjects,
+    n_abx = n_abx,
+    ii_subjects = ii_subjects,
+    abx = abx,
+    total = total,
+    reads = reads,
+    prev = prev
+  )
+  
+  params <- list(
+    a = a,
+    a_subj = a_subj,
+    s_subj = s_subj,
+    s_abx = s_abx,
+    s_abxp = s_abxp,
+    b_lag = b_lag,
+    b_abx = b_abx,
+    b_abxp = b_abxp
+  )
+  list(data=data, params=params)
+}
+set.seed(32)
+dsim205 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 0.2
+  s_abx <- rexp(n_abx, 1)
+  s_abxp <- rexp(n_abx, 1)
+  s_subj <- rexp(1, 1)
+  a_subj <- rnorm(n_subjects, 0, s_subj);
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  b_abxp <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abxp), nrow=n_abx, ncol=n_subjects))
+  b_abx[1,1] <- 1
+  b_abxp[1,1] <- 1
+  b_lag <- 0.5
+  sim205.generator(10, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx, s_abxp, b_abxp, b_lag, F)
+})
+set.seed(32)
+dsim205.2 <- with(data.frame(), {
+  n_subjects <- 6
+  n_abx <- 5
+  a <- 0.2
+  s_abx <- rexp(n_abx, 1)
+  s_abxp <- rexp(n_abx, 1)
+  s_subj <- rexp(1, 1)
+  a_subj <- rnorm(n_subjects, 0, s_subj);
+  b_abx <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abx), nrow=n_abx, ncol=n_subjects))
+  b_abxp <- t(matrix(rnorm(n_subjects*n_abx, mean=0, sd=s_abxp), nrow=n_abx, ncol=n_subjects))
+  b_abx[1,1] <- 1
+  b_abxp[1,1] <- 1
+  b_lag <- 0.5
+  sim205.generator(10, n_subjects, n_abx, a, a_subj, s_subj, s_abx, b_abx, s_abxp, b_abxp, b_lag, T)
+})
+dsim205.2$data$reads[11:60] <- dsim205$data$reads[11:60]
+dsim205.2$data$prev[11:60] <- dsim205$data$prev[11:60]
+```
+
+### Fitting (v2.0.5.1)
+
+```{r}
+set.seed(123)
+m205.1 <- stan(
+  file="arb_2.0.4.stan", data=dsim205$data, cores=4, 
+  control=list(max_treedepth=15, adapt_delta=0.99), seed=123)
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abxp <- reshape2::melt(dsim205$params$b_abxp, varnames=c("subject", "abx"))
+  p <- m205.1 %>%
+    spread_samples(b_abxp[subject, abx]) %>%
+    ggplot(aes(x = b_abxp, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abxp, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abxp' (v1)")
+  plot(p)
+}))
+```
+
+### Fitting (v2.0.5.2)
+
+```{r}
+set.seed(123)
+m205.2 <- stan(
+  file="arb_2.0.4.stan", data=dsim205.2$data, cores=4, 
+  control=list(max_treedepth=15, adapt_delta=0.99), seed=123)
+```
+
+```{r}
+invisible(with(data.frame(), {
+  # browser()
+  true_b_abxp <- reshape2::melt(dsim205.2$params$b_abxp, varnames=c("subject", "abx"))
+  p <- m205.2 %>%
+    spread_samples(b_abxp[subject, abx]) %>%
+    ggplot(aes(x = b_abxp, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+    stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+    geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+    geom_point(data=true_b_abxp, aes(x=value, fill=NULL, color="True value")) +
+    scale_fill_viridis_c("Probability", direction=1, option="C") +
+    scale_color_manual("", values=c("True value"="dodgerblue")) +
+    facet_wrap(vars(abx), scales="free") +
+    ggtitle("Estimates vs true values of 'b_abxp' (v2)")
+  plot(p)
+}))
+```
+
+It seems it does slightly affect the other parameters, but I do not want to address this currently due to the complexity of assigning different priors to different betas.
+
+### Fitting (real data)
+
+```{r}
+dat205.generator <- function(d2, .specimen_type, min_times_abx=1) {
+  d3 <- d2 %>% filter(specimen_type==.specimen_type) %>%
+    distinct(subject_id, specimen_id2, read_count, total_reads, study_day) %>%
+    group_by(subject_id) %>%
+    arrange(subject_id, study_day) %>%
+    mutate(prev = lag(read_count)/lag(total_reads)) %>%
+    right_join(d2) %>%
+    filter(!is.na(prev)) %>%
+    rename(reads=read_count, total=total_reads, specimens=specimen_id2, subjects=subject_id) %>%
+    mutate(abx_b = ifelse(is.na(abx_b), "none", abx_b))
+  
+  abx_tally <- d3 %>% group_by(abx_b) %>% 
+    summarize(n_subjects = n_distinct(subjects), n_admins=n())
+  abx_to_keep <- filter(abx_tally, n_subjects > 3, abx_b != "none")$abx_b
+  subjects_to_keep <- (d3 %>% filter(abx_b %in% abx_to_keep) %>% distinct(subjects))$subjects
+
+  d4 <- d3 %>% ungroup() %>%
+    filter(subjects %in% subjects_to_keep)
+  d_abx <- d4 %>%
+    reshape2::dcast(specimens + subjects + reads + total + prev ~ abx_b, value.var="abx_yn", fill=0)
+  result <- tidybayes::compose_data(d_abx[, c(1:5)])
+  abx <- as.matrix(d_abx[, -c(1:5)])
+  # Remove abxs seen less than the minimum, and the NA column
+  abx <- abx[, abx_to_keep, drop=F]
+  result$abx_b <- as.numeric(as.factor(colnames(abx)))
+  result$n_abx <- ncol(abx)
+  result$abx <- abx
+  result$d4 <- d4
+  result
+}
+
+d205.3 <- dat205.generator(d2, "Sputum", 40)
+
+# Correlation checking - come back later
+# abx.cor <- cor(abx)
+# diag(abx.cor) <- NA
+# abx.cor[lower.tri(abx.cor)] <- NA
+# abx.cor <- reshape2::melt(abx.cor)
+
+m205.3 <- stan(
+  file="arb_2.0.5.stan", data=d205.3, cores=4, iter=500, chains=4,
+  control=list(max_treedepth=17, adapt_delta=0.9))
+saveRDS(m205.3, file="fit_arb_2.0.5_sputum.rds")
+```
+
+```{r}
+bayesplot::mcmc_trace(
+  rstan::extract(m205.3, inc_warmup=T, permuted=F), 
+  pars=c("a", "b_abx[1,1]", "s_abx[1]"))
+```
+
+```{r}
+s205.sp <- summary(m205.3)$summary %>% as.data.frame() %>% 
+  rownames_to_column("parameter") %>% as.tibble()
+s205.sp %>% filter(Rhat >= 1.1) %>% kable()
+```
