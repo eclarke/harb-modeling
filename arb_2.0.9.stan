@@ -66,15 +66,15 @@ model {
   
   a_subj ~ normal(0, s_subj);
   // za_subj ~ normal(0, 5);
-  s_subj ~ cauchy(0, 5);
+  s_subj ~ normal(0, 5);
   
   a_spec ~ normal(0, s_spec);
   // za_spec ~ normal(0, 5);
-  s_spec ~ cauchy(0, 5);
+  s_spec ~ normal(0, 5);
   
   // za_abx  ~ normal(0, 2);
   // za_abxp ~ normal(0, 2);
-  s_abx  ~ cauchy(0, 2);
+  s_abx  ~ normal(0.5, 0.5);
   // s_abxp ~ cauchy(0, 2);
 
   for (i in 1:n_subjects) {

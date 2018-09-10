@@ -24,15 +24,15 @@ parameters {
   real a_spec[n_specimens];
   real a_subj[n_subjects];
 
-  matrix[n_subjects, n_abx] b_abx;
+  matrix[n_subjects, n_abx] zb_abx;
   // matrix[n_subjects, n_abx] b_abxp;
 
   // Non-centered parameterization for b_abx and b_abxp
   // matrix[n_subjects, n_abx] zb_abx;   // Non-centered slopes for each subject + abx
   // matrix[n_subjects, n_abx] zb_abxp;  // NC slopes for each subject + (abx * prev prop)
-  row_vector<lower=0>[n_abx] s_abx;   // Abx-specific variances for NCP
+  vector<lower=0>[n_abx] s_abx;   // Abx-specific variances for NCP
   // row_vector<lower=0>[n_abx] s_abxp;  // Abx-specific variances for b_abxp term in NCP
-  // row_vector[n_abx] za_abx;           // Abx-specific intercepts for NCP
+  vector[n_abx] za_abx;           // Abx-specific intercepts for NCP
   // row_vector[n_abx] za_abxp;          // Abx-specific intercepts for b_abxp in NCP
 }
 transformed parameters {
@@ -40,6 +40,7 @@ transformed parameters {
   // real a_spec[n_specimens];
   // real a_subj[n_subjects];
 
+  matrix[n_subjects, n_abx] b_abx;
   // matrix[n_subjects, n_abx] b_abxp;
   for (i in 1:n_specimens) {
     int subject_id = subjects[i];
@@ -52,7 +53,7 @@ transformed parameters {
     for (j in 1:n_abx) {
       // NCP for b_abx and b_abxp:
       // b_abxp[subject_id, j] = za_abxp[j] + zb_abxp[subject_id, j] * s_abxp[j];
-      // b_abx[subject_id, j] = za_abx[j] + zb_abx[subject_id, j] * s_abx[j];
+      b_abx[subject_id, j] = za_abx[j] + zb_abx[subject_id, j] * s_abx[j];
       phi[i] += (
         // b_abxp[subject_id, j] * abx[i, j] * prev[i] +
         b_abx[subject_id, j] * abx[i, j]
@@ -66,19 +67,19 @@ model {
   
   a_subj ~ normal(0, s_subj);
   // za_subj ~ normal(0, 5);
-  s_subj ~ cauchy(0, 5);
+  s_subj ~ normal(0, 5);
   
   a_spec ~ normal(0, s_spec);
   // za_spec ~ normal(0, 5);
-  s_spec ~ cauchy(0, 5);
+  s_spec ~ normal(0, 5);
   
   // za_abx  ~ normal(0, 2);
   // za_abxp ~ normal(0, 2);
-  s_abx  ~ cauchy(0, 2);
+  s_abx  ~ normal(0.5, 0.5);
   // s_abxp ~ cauchy(0, 2);
 
   for (i in 1:n_subjects) {
-    b_abx[i, ] ~ normal(0, s_abx);
+    zb_abx[i, ] ~ normal(0, s_abx);
     // b_abxp[i,] ~ normal(0, s_abxp);
   }
   
