@@ -1414,10 +1414,21 @@ Let's see if this scales to more antibiotics/subjects:
 d2011.2 <- dat2011.generator(d2, "Sputum", 3, 3)
 m2011.3 <- stan(
   file="arb_2.0.11.stan", data=d2011.2, cores=4, iter=3000, chains=4, 
-  control=list(max_treedepth=18, adapt_delta=0.8))
+  control=list(max_treedepth=18, adapt_delta=0.87))
 saveRDS(m2011.3, "fit_arb_2.0.11.3.rds")
 ```
 
 There are mixing issues with the chains for some of the sigma terms. Checking the pairs plots and the traces shows one of the chains gets "stuck" in zero-ish modes where the rest of the chains don't go. Increasing the iterations from 1000 to 3000 may permit more mixing?
+
+As it turns out, increasing the iterations leads to divergent transitions. Were we not running enough iterations to detect these divergences before? They all occur out near the edges of the s_abx[5] parameter, which corresponds to vancomyciniv- not exactly a poorly informed antibiotic.
+
+```{r}
+pairs(m2011.3, pars=c(
+  parameters(m2011.3)[grep("^s_abx", parameters(m2011.3))][1:5], 
+  "b_abx[1,5]",
+  "b_abx[7,5]",
+  "lp__"))
+```
+
 
 
