@@ -1401,10 +1401,20 @@ m2011.1 <- stan(
 There are still issues resolving the s_abx parameters. I wonder if a non-centered parameterization would help?
 
 ```{r}
-m2011.1 <- stan(
+m2011.2 <- stan(
   file="arb_2.0.11.stan", data=d2011.1, cores=4, iter=1000, chains=4, 
   control=list(max_treedepth=18, adapt_delta=0.8))
 ```
 
+That seems to have done it. Centered parameterization for the intercepts and non-centered parameterizations for the betas.
+
+Let's see if this scales to more antibiotics/subjects:
+
+```{r}
+d2011.2 <- dat2011.generator(d2, "Sputum", 3, 3)
+m2011.3 <- stan(
+  file="arb_2.0.11.stan", data=d2011.2, cores=4, iter=1000, chains=4, 
+  control=list(max_treedepth=18, adapt_delta=0.8))
+```
 
 
