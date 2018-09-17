@@ -47,7 +47,6 @@ library(magrittr)
 library(tsibble)
 library(rstan)
 library(ggridges)
-library(patchwork)
 library(rethinking)
 # library(kableExtra)
 rstan_options(auto_write = TRUE)
@@ -1430,5 +1429,150 @@ pairs(m2011.3, pars=c(
   "lp__"))
 ```
 
+Increasing adapt_delta significantly improves these divergences, but I feel like this suggests reparameterizing would be better.
+
+## Model v2.0.12
+
+### v2012 Generator
+
+```{r}
+dat2012.generator <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, thin=1) {
+  d3 <- d2 %>% filter(specimen_type==.specimen_type) %>%
+    distinct(subject_id, specimen_id2, read_count, total_reads, study_day) %>%
+    group_by(subject_id) %>%
+    arrange(subject_id, study_day) %>%
+    mutate(prev = lag(read_count)/lag(total_reads)) %>%
+    right_join(d2) %>%
+    filter(!is.na(prev)) %>%
+    rename(reads=read_count, total=total_reads, specimens=specimen_id2, subjects=subject_id) %>%
+    mutate(abx_b = ifelse(is.na(abx_b), "none", abx_b))
+  # browser()
+  d3.thinned <- sample_frac(d3, size=thin)
+  abx_to_keep <- (d3.thinned %>% group_by(abx_b, subjects) %>%
+    filter(abx_b != "none") %>%
+    summarize(n=n()) %>% 
+    mutate(n_subjects=n()) %>%
+    filter(n_subjects >= min_times_abx, median(n) >= min_median_abx) %>%
+    distinct(abx_b))$abx_b
+#  abx_to_keep <- filter(abx_tally, n_subjects > min_times_abx, abx_b != "none")$abx_b
+
+  subjects_to_keep <- (filter(d3.thinned, abx_b %in% abx_to_keep) %>% distinct(subjects))$subjects 
+
+  stopifnot(length(subjects_to_keep) > 0)
+  
+  d4 <- d3.thinned %>% ungroup() %>%
+    filter(subjects %in% subjects_to_keep)
+  d_abx <- d4 %>%
+    reshape2::dcast(subjects + specimens + reads + total + prev ~ abx_b, value.var="abx_yn", fill=0)
+  # browser()
+  result <- tidybayes::compose_data(d_abx[, c(1:5)])
+  abx <- as.matrix(d_abx[, -c(1:5)])
+  # Remove abxs seen less than the minimum, and the NA column
+  abx <- abx[, abx_to_keep, drop=F]
+  result$abx_b <- as.numeric(as.factor(colnames(abx)))
+  result$n_abx <- ncol(abx)
+  result$abx <- abx
+  result$d4 <- d4
+  result$d_abx <- d_abx[, c(1:5)]
+  result
+}
+
+d2012.1 <- dat2012.generator(d2, "Sputum", 4, 3, 0.7)
+d2012.2 <- dat2012.generator(d2, "Sputum", 2, 3, 0.2)
+d2012.3 <- dat2012.generator(d2, "Sputum", 4, 3, 1)
+d2012.4 <- dat2012.generator(d2, "Sputum", 2, 2, 1)
+```
+
+```{r}
+m2012 <- stan(
+  file="arb_2.0.12.stan", data=d2012.3, cores=4, iter=5000, chains=4, 
+  control=list(max_treedepth=18, adapt_delta=0.99))
+saveRDS(m2012, "fit_arb_2.0.12_sputum.rds")
+```
+
+```{r}
+pairs(m2012, pars=c(
+  parameters(m2012)[grep("^s_abx", parameters(m2012))], 
+  "s_subj",
+  "b_abx2[1,1]",
+  "b_abx2[2,1]",
+  # "b_abx2[1,2]",
+  "b_abx1[1]",
+  # "b_abx1[2]",
+  "lp__"))
+pairs(m2012, pars=c(
+  parameters(m2012)[grep("^a_subj", parameters(m2012))][1:5], 
+  "s_subj",
+  "lp__"))
+```
+
+Let's try it with as comprehensive of a dataset as we can muster:
+
+```{r}
+m2012.2 <- stan(
+  file="arb_2.0.12.stan", data=d2012.4, cores=4, iter=5000, chains=4, 
+  control=list(max_treedepth=18, adapt_delta=0.99))
+saveRDS(m2012.2, "fit_arb_2.0.12.2_sputum.rds")
+saveRDS(d2012.4, "arb_2.0.12.2_sputum_data.rds")
+```
+
+### Results
+
+Let's plot the estimates for various coefficients:
+
+```{r}
+m2012.2 %>%
+  spread_samples(b_abx2[subject, abx]) %>%
+  ggplot(aes(x = b_abx2, y=fct_rev(as.factor(subject)), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  facet_wrap(vars(abx), scales="free") +
+  ggtitle("Subject-level abx effects")
+```
+
+
+```{r}
+m2012.2 %>%
+  spread_samples(b_abx1[abx]) %>%
+  ggplot(aes(x = b_abx1, y=fct_rev(as.factor(abx)), fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C") +
+  ggtitle("Global-level abx effects")
+```
+
+```{r}
+m2012.2 %>%
+  gather_samples(a, b_lag, s_abx1) %>%
+  ggplot(aes(x = estimate, y=term, fill=0.5-abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=TRUE, scale=1) +
+  geom_vline(aes(xintercept=0), linetype=2, alpha=0.4) +
+  scale_fill_viridis_c("Probability", direction=1, option="C")
+```
+
+### Posterior predictive checks
+
+```{r}
+
+m2012.2 %>%
+  spread_draws(a, b_lag, b_abx2[subject, abx], b_abx1[abx], a_subj[subject]) %>%
+  mutate(with_abx = logistic(a + a_subj + b_abx1 + b_abx2 + b_lag*0.5)) %>%
+  mutate(without_abx = logistic(a + a_subj + b_lag*0.5)) %>%
+  mutate(difference = with_abx-without_abx) %>%
+  # median_qi(difference) %>%
+  ungroup() %>%
+  mutate(abx_c=colnames(d2012.4$abx)[abx]) %>%
+  ggplot(aes(y=subject, x=difference)) +
+  geom_vline(xintercept=0, linetype="dashed") +
+  stat_pointintervalh(size_range=c(0.3,0.5)) +
+  # geom_pointintervalh(size_range = c(0.5,0.5), color="dodgerblue") +
+  facet_wrap(vars(abx_c), scales="free_x") +
+  theme_classic() +
+  labs(
+    title="Antibiotic effect on Staphlyococcus", 
+    x="Change in probability with abx", y="Subject")
+
+```
 
 
