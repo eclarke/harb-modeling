@@ -13,44 +13,35 @@ parameters {
   real a;     // Global intercept
   real b_lag; // Global lag coefficient
 
-  // Non-centered parameterization for a_spec
-  // real za_spec[n_specimens];  // Standardized intercepts for each specimen
-  real<lower=0> s_spec;       // Pooled specimen variance
+  real a_spec[n_specimens]; // Specimen intercepts
+  real<lower=0> s_spec;     // Pooled specimen variance
   
-  // Non-centered parameterization for a_subj
-  // real za_subj[n_subjects]; // Subject-specific intercepts
+  real a_subj[n_subjects];  // Subject intercepts
   real<lower=0> s_subj;     // Pooled subject variance
 
-  real a_spec[n_specimens];
-  real a_subj[n_subjects];
-
+  // Non-centered parameterization for b_abx1
+  // b_abx1 = za_abx1 + zb_abx1 * s_abx1
   vector[n_abx] zb_abx1;
   real za_abx1;
   real<lower=0> s_abx1;
   
+  // Non-centered parameterization for b_abx2
+  // b_abx2 = za_abx2 + zb_abx2 * s_abx2
   matrix[n_subjects, n_abx] zb_abx2;
   vector[n_abx] za_abx2;
   vector<lower=0>[n_abx] s_abx2;
-
 }
 transformed parameters {
   real phi[n_specimens];
-  // real a_spec[n_specimens];
-  // real a_subj[n_subjects];
 
   vector[n_abx] b_abx1;
   matrix[n_subjects, n_abx] b_abx2;
-  // matrix[n_subjects, n_abx] b_abxp;
+
   for (i in 1:n_specimens) {
     int subject_id = subjects[i];
-    // NCP for a_spec and a_subj
-    // a_spec[i] = za_spec[i] * s_spec;
-    // a_subj[subject_id] = za_subj[subject_id] * s_subj;
-    
-    phi[i] = a + a_subj[subject_id] + b_lag * prev[i] + a_spec[i];
+    phi[i] = a + a_spec[i] + a_subj[subject_id] + b_lag * prev[i];
     // Add each antibiotic-specific coefficient separately
     for (j in 1:n_abx) {
-      // NCP for b_abx and b_abxp:
       b_abx1[j] = za_abx1 + zb_abx1[j] * s_abx1;
       b_abx2[subject_id, j] = za_abx2[j] + zb_abx2[subject_id, j] * s_abx2[j];
       phi[i] += (
