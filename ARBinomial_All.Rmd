@@ -7,9 +7,104 @@ editor_options:
   chunk_output_type: console
 ---
 
-
 ```{r setup}
 library(tidyverse)
 library(rstan)
+library(tidybayes)
+library(rethinking)
+knitr::opts_chunk$set(
+  echo=TRUE,
+  cache=TRUE,
+  prompt=FALSE,
+  comment=NA,
+  message=FALSE,
+  warning=FALSE,
+  results="hide")
+```
+
+```{r read-models}
+read_rds_files <- function(path, filename) {
+  print(path)
+  if (file.exists(file.path(path, filename))) {
+    readRDS(file.path(path, filename))
+  }
+}
+
+model_paths <- Sys.glob("*_2012")
+models <- data.frame(str_split_fixed(model_paths, "_", 4)[,2:3])
+models$path <- model_paths
+colnames(models) <- c("lineage", "specimen_type", "path")
+models %>% mutate(
+  model2 = sapply(path, read_rds_files, "fitted_model.rds")
+)
+models$model <- sapply(models$path, function(path) {
+  print(path)
+  if (file.exists(file.path(path, "fitted_model.rds"))) {
+    return(readRDS(file.path(path, "fitted_model.rds")))
+  } else {
+    return(NA)
+  }
+})
+models$df <- sapply(models$path, function(path) {
+  print(path)
+  if (file.exists(file.path(path, "data.rds"))) {
+    return(readRDS(file.path(path, "data.rds")))
+  } else {
+    return(NA)
+  }
+})
+models <- filter(models, !is.na(model)) %>%
+  mutate(specimen_type = fct_recode(as.factor(specimen_type), "Stool Swab"="StoolSwab", "Oral Swab"="OralSwab", "Sputum"="sputum"))
+```
+
+```{r}
+summarize_model <- function(model, data) {
+  # browser()
+  tidybayes::recover_types(model, data$d_abx) %>%
+    spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
+    mutate(with_abx = logistic(a + a_subj + b_abx1 + b_abx2 + b_lag*0.5)) %>%
+    mutate(without_abx = logistic(a + a_subj + b_lag*0.5)) %>%
+    mutate(difference = with_abx-without_abx) %>%
+    ungroup() %>%
+    mutate(abx=colnames(data$abx)[abx]) %>%
+    group_by(abx, subjects) %>%
+    median_qi(.width=c(0.95, 0.5))
+}
+
+draws <- plyr::ddply(models, c("lineage", "specimen_type"), function(df) {
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  return(summary)
+})
+```
+
+```{r}
+draws %>% 
+  filter(.width == 0.5) %>%
+  # filter(specimen_type == "Oral Swab") %>%
+  ggplot(aes(x=abx, y=difference, group=subjects, color=difference<0)) +
+  geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper),
+    position=position_dodge(width=0.8), 
+    size_range = c(0.2, 0.5), alpha=0.4, show.legend=TRUE) +
+  # geom_boxplot() +
+  scale_y_continuous(labels=scales::percent, breaks = scales::pretty_breaks()) +
+  scale_size_continuous(guide = F) +
+  scale_color_discrete("", labels=c("FALSE"="Decrease in likelihood", "TRUE"="Zero or increase in likelihood")) +
+  facet_grid(rows=vars(specimen_type), cols=vars(lineage), scales="free") +
+  theme_bw()+
+  theme(legend.position = "bottom") +
+  coord_flip() +
+  labs(
+    x="antibiotic", y="Delta %", title="Antibiotic effects on bacterial lineage by specimen type", 
+    caption="Change in likelihood of seeing the bacteria before and after antibiotic administration")
+ggsave("figures/m2012_abx_effect_by_lineage.pdf", width=18, height=7)
 ```
 
