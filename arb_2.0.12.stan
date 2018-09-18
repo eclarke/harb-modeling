@@ -1,9 +1,25 @@
+/* 
+* Autoregressive binomial model, v2.0.12
+* 
+* reads ~ Binomial(total, logit(phi))
+* phi[i,j,k] = a + a_spec[i] + a_subj[j] + (b_abx1[k] * abx[i,k]) + (b_abx2[j,k] * abx[i,k]) + (b_lag * prev[i])
+* 
+* a = global intercept
+* a_spec[i] = specimen i intercept (partially pooled between specimens)
+* a_subj[j] = subject j intercept (partially pooled btwn subjects)
+* b_abx1[k] = antibiotic k slope (partially pooled btwn abx)
+* abx[i,k] = indicator variable for antibiotic k at specimen i
+* b_abx2[j,k] = subject j + antibiotic k slope (partially pooled between subjects)
+* b_lag = coefficient for previous specimen's reads
+* prev[i] = previous specimen's reads (as proportion of total)
+*
+*/
 data {
   int<lower=1> n_specimens;         // Number of timepoints
   int<lower=1> n_subjects;          // Number of subjects
   int<lower=1> n_abx;               // Number of antibiotics
-  int subjects[n_specimens];        // Index of subject for each timepoint
-  matrix[n_specimens, n_abx] abx;   // Antibiotics on/off for each timepoint/abx
+  int subjects[n_specimens];        // Index of subject for each specimen
+  matrix[n_specimens, n_abx] abx;   // Antibiotics on/off for each specimen/abx
   int reads[n_specimens];           // Reads of target bacteria
   int total[n_specimens];           // Total reads 
   real prev[n_specimens];           // Previous proportion
