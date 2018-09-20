@@ -23,42 +23,34 @@ knitr::opts_chunk$set(
 ```
 
 ```{r read-models}
-read_rds_files <- function(path, filename) {
-  print(path)
-  if (file.exists(file.path(path, filename))) {
-    readRDS(file.path(path, filename))
+load_models <- function(glob) {
+  read_rds_file <- function(path, filename) {
+    print(path)
+    if (file.exists(file.path(path, filename))) {
+      readRDS(file.path(path, filename))
+    } else {
+      NA
+    }
   }
+  paths <- Sys.glob(glob)
+  models <- data.frame(str_split_fixed(paths, "_", 4)[,2:3])
+  models$path <- paths
+  colnames(models) <- c("lineage", "specimen_type", "path")
+  models %>% 
+    mutate(model = sapply(path, read_rds_file, "fitted_model.rds")) %>%
+    mutate(df = sapply(path, read_rds_file, "data.rds", simplify = F)) %>%
+    filter(!is.na(model)) %>%
+    
+    mutate(specimen_type = fct_recode(
+      as.factor(specimen_type), 
+      "Stool Swab"="StoolSwab", "Oral Swab"="OralSwab", "Sputum"="sputum"))
 }
-
-model_paths <- Sys.glob("*_2012")
-models <- data.frame(str_split_fixed(model_paths, "_", 4)[,2:3])
-models$path <- model_paths
-colnames(models) <- c("lineage", "specimen_type", "path")
-models %>% mutate(
-  model2 = sapply(path, read_rds_files, "fitted_model.rds")
-)
-models$model <- sapply(models$path, function(path) {
-  print(path)
-  if (file.exists(file.path(path, "fitted_model.rds"))) {
-    return(readRDS(file.path(path, "fitted_model.rds")))
-  } else {
-    return(NA)
-  }
-})
-models$df <- sapply(models$path, function(path) {
-  print(path)
-  if (file.exists(file.path(path, "data.rds"))) {
-    return(readRDS(file.path(path, "data.rds")))
-  } else {
-    return(NA)
-  }
-})
-models <- filter(models, !is.na(model)) %>%
-  mutate(specimen_type = fct_recode(as.factor(specimen_type), "Stool Swab"="StoolSwab", "Oral Swab"="OralSwab", "Sputum"="sputum"))
+models2012 <- load_models("*_2012")
+models2013 <- load_models("*_2013")
 ```
 
 ```{r}
-summarize_model <- function(model, data) {
+summarize_model2012 <- function(model, data) {
   # browser()
   tidybayes::recover_types(model, data$d_abx) %>%
     spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
@@ -71,13 +63,38 @@ summarize_model <- function(model, data) {
     median_qi(.width=c(0.95, 0.5))
 }
 
-draws <- plyr::ddply(models, c("lineage", "specimen_type"), function(df) {
+summarize_model2013 <- function(model, data) {
+  # browser()
+  tidybayes::recover_types(model, data$d_abx) %>%
+    spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
+    mutate(with_abx = logistic(a + a_subj + (b_abx1 + b_abx2)*0.01 + b_lag*0.01)) %>%
+    mutate(without_abx = logistic(a + a_subj + b_lag*0.01)) %>%
+    mutate(difference = with_abx-without_abx) %>%
+    ungroup() %>%
+    mutate(abx=colnames(data$abx)[abx]) %>%
+    group_by(abx, subjects) %>%
+    median_qi(.width=c(0.95, 0.5))
+}
+
+draws2012 <- plyr::ddply(models2012, c("lineage", "specimen_type"), function(df) {
   lineage <- as.character(unique(df$lineage))
   specimen_type <- as.character(unique(df$specimen_type))
   print(sprintf("%s, %s", lineage, specimen_type))
   model <- df$model[[1]]
   data <- df$df[[1]]
-  summary <- summarize_model(model, data)
+  summary <- summarize_model2012(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  return(summary)
+})
+
+draws2013 <- plyr::ddply(models2013, c("lineage", "specimen_type"), function(df) {
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model2013(model, data)
   summary$specimen_type <- specimen_type
   summary$lineage <- lineage
   return(summary)
@@ -85,19 +102,38 @@ draws <- plyr::ddply(models, c("lineage", "specimen_type"), function(df) {
 ```
 
 ```{r}
-draws %>% 
+draws2012 %>% 
   filter(.width == 0.5) %>%
-  # filter(specimen_type == "Oral Swab") %>%
   ggplot(aes(x=abx, y=difference, group=subjects, color=difference<0)) +
   geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
   geom_pointinterval(
     aes(ymin=difference.lower, ymax=difference.upper),
     position=position_dodge(width=0.8), 
     size_range = c(0.2, 0.5), alpha=0.4, show.legend=TRUE) +
-  # geom_boxplot() +
   scale_y_continuous(labels=scales::percent, breaks = scales::pretty_breaks()) +
   scale_size_continuous(guide = F) +
-  scale_color_discrete("", labels=c("FALSE"="Decrease in likelihood", "TRUE"="Zero or increase in likelihood")) +
+  scale_color_discrete("", labels=c("TRUE"="Decrease in likelihood", "FALSE"="Zero or increase in likelihood")) +
+  facet_grid(rows=vars(specimen_type), cols=vars(lineage), scales="free") +
+  theme_bw()+
+  theme(legend.position = "bottom") +
+  coord_flip() +
+  labs(
+    x="antibiotic", y="Delta %", title="Antibiotic effects on bacterial lineage by specimen type", 
+    caption="Change in likelihood of seeing the bacteria before and after antibiotic administration")
+ggsave("figures/m2012_abx_effect_by_lineage.pdf", width=18, height=7)
+```
+
+```{r}
+draws2012 %>% 
+  filter(.width == 0.5, lineage=="Staphylococcus") %>%
+  # filter(specimen_type == "Oral Swab") %>%
+  ggplot(aes(x=abx, y=b_abx1, group=subjects, color=abx)) +
+  geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
+  geom_pointinterval(
+    aes(ymin=b_abx1.lower, ymax=b_abx1.upper),
+    position=position_dodge(width=0.8), 
+    size_range = c(0.2, 0.5), alpha=0.4) +
+  scale_size_continuous(guide = F) +
   facet_grid(rows=vars(specimen_type), cols=vars(lineage), scales="free") +
   theme_bw()+
   theme(legend.position = "bottom") +
