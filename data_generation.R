@@ -7,12 +7,8 @@
 #' 
 #' Generic functions should not be versioned.
 
-#' Loads and cleans MIRA data. 
-#' This function uses relative paths and may not function outside the 
-#' original directory structure.
-#' 
-#' @return a phyloseq experiment object with the relevant data
-load_data <- function() {
+
+load_mira_phyloseq <- function(css_normalize=FALSE) {
   mira.all <- load_mira_data(
     seqtab_fp = here("../shared/data/seqtab.rds"),
     taxa_fp = here("../shared/data/taxa.rds"),
@@ -61,18 +57,23 @@ load_data <- function() {
   
   # Restrict to only samples for which we have abx data
   .abx_specimens <- as.character(inner_join(sample_data(mira), meds)$specimen_id2)
-  prune_samples(
+  mira.abx <- prune_samples(
     sample_data(mira)$specimen_id2 %in% .abx_specimens, mira)
+  
+  # Normalize if requested
+  if (css_normalize) {
+    gt1_feature_samples <- rowSums(otu_table(mira) > 0) > 1
+    message(sprintf("removing %d samples for having < 2 features", length(gt1_feature_samples)-sum(gt1_feature_samples)))
+    mira.abx.gt1 <- prune_samples(names(which(gt1_feature_samples)), mira.abx)
+    normalized <- t(metagenomeSeq::cumNormMat(t(mira.abx.gt1@otu_table@.Data)))
+    otu_table(mira.abx.gt1) <- otu_table(normalized, taxa_are_rows = F)
+    mira.abx <- mira.abx.gt1
+  }
+  
+  return(list(mira.abx=mira.abx, meds=meds))
 }
 
-#' Converts the phyloseq object from `load_data` into an agglomerated dataframe
-#' and cleans up subject/antibiotic data.
-#' 
-#' @return a cleaned and agglomerated dataframe
-clean_data <- function(mira.abx, .genus, .species=NULL) {
-  if (missing(.genus)) {
-    stop("Must specify genus")
-  }
+clean_data <- function(mira.abx, meds, .genus, .species) {
   # Converted to melted form
   agg <- phyloseq_to_agglomerated(mira.abx, "specimen_id2", "otu_id", "read_count") %>%
     group_by(specimen_id2) %>%
@@ -144,7 +145,8 @@ clean_data <- function(mira.abx, .genus, .species=NULL) {
     filter((abx_b2 != "piperacillin") | is.na(abx_b2)) %>%
     mutate(abx_b = abx_b2) %>%
     select(-abx_b2) %>%
-    mutate(abx_idx = as.numeric(as.factor(abx_b)))
+    mutate(abx_idx = as.numeric(as.factor(abx_b))) %>%
+    mutate(abx_yn = ifelse(is.na(abx_b), 0, 1))
   
   if (is.null(.species)) {
     d <- agg %>%
@@ -171,7 +173,8 @@ clean_data <- function(mira.abx, .genus, .species=NULL) {
   left_join(subjects, d)
 }
 
-gen_01 <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, min_reads_subj=1) {
+
+gen01 <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, min_reads_subj=1) {
   d3 <- d2 %>% filter(specimen_type==.specimen_type) %>%
     distinct(subject_id, specimen_id2, read_count, total_reads, study_day) %>%
     group_by(subject_id) %>%
@@ -212,35 +215,51 @@ gen_01 <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, min_re
 }
 
 #' Frameshifts antibiotics by one day.
-gen_02 <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, min_reads_subj=1) {
-  d3 <- d2 %>% filter(specimen_type==.specimen_type) %>%
-    distinct(subject_id, specimen_id2, read_count, total_reads, study_day) %>%
-    group_by(subject_id) %>%
+gen02 <- function(d, .specimen_type, min_times_abx=2, min_median_abx=2, min_reads_subj=1) {
+  d <- d %>% filter(specimen_type==.specimen_type) %>%
+    select(specimen_id2, subject_id, study_day, read_count, total_reads, abx_b)
+  # Nest multiple antibiotics into a list-column
+  d2 <- d %>% group_by(specimen_id2) %>%
+    nest(abx_b, .key="abx_nested") %>%
+    left_join(select(d, -abx_b)) %>% 
+    distinct(specimen_id2, .keep_all = TRUE)
+  # Remove subjects with fewer than the min. total reads for the target taxa
+  d3 <- d2 %>% group_by(subject_id) %>%
     filter(sum(read_count) > min_reads_subj) %>%
+    ungroup()
+  message(sprintf(
+    "Removed %d subjects for having <= %d reads on target", 
+    n_distinct(d3$subject_id)-n_distinct(d2$subject_id), min_reads_subj))
+
+  # Add lag columns for previous day's proportions and antibiotics
+  d4 <- d3 %>%
     arrange(subject_id, study_day) %>%
+    group_by(subject_id) %>%
     mutate(prev = lag(read_count)/lag(total_reads)) %>%
-    mutate(abx_b = lag(abx_b)) %>%
-    right_join(d2) %>%
+    mutate(abx_lag = lag(abx_nested, default = list(tibble(abx_b=NA)))) %>%
+    unnest(abx_lag, .preserve=abx_nested) %>%
+    rename(abx_lag = abx_b) %>%
     filter(!is.na(prev)) %>%
     rename(reads=read_count, total=total_reads, specimens=specimen_id2, subjects=subject_id) %>%
-    mutate(abx_b = ifelse(is.na(abx_b), "none", abx_b))
+    mutate(abx_yn = ifelse(is.na(abx_lag), 0, 1)) %>% 
+    mutate(abx_lag = ifelse(is.na(abx_lag), "none", abx_lag)) 
+
   
-  abx_to_keep <- (d3 %>% group_by(abx_b, subjects) %>%
-                    filter(abx_b != "none") %>%
+  abx_to_keep <- (d4 %>% group_by(abx_lag, subjects) %>%
+                    filter(abx_lag != "none") %>%
                     summarize(n=n()) %>% 
                     mutate(n_subjects=n()) %>%
                     filter(n_subjects >= min_times_abx, median(n) >= min_median_abx) %>%
-                    distinct(abx_b))$abx_b
+                    distinct(abx_lag))$abx_lag
   
-  subjects_to_keep <- (filter(d3, abx_b %in% abx_to_keep) %>% distinct(subjects))$subjects 
+  subjects_to_keep <- (filter(d4, abx_lag %in% abx_to_keep) %>% distinct(subjects))$subjects 
   
   stopifnot(length(subjects_to_keep) > 0)
   
-  d4 <- d3 %>% ungroup() %>%
+  d5 <- d4 %>% ungroup() %>%
     filter(subjects %in% subjects_to_keep)
-  d_abx <- d4 %>%
-    reshape2::dcast(subjects + specimens + reads + total + prev ~ abx_b, value.var="abx_yn", fill=0)
-  # browser()
+  d_abx <- d5 %>%
+    reshape2::dcast(subjects + specimens + reads + total + prev ~ abx_lag, value.var="abx_yn", fill=0)
   result <- tidybayes::compose_data(d_abx[, c(1:5)])
   abx <- as.matrix(d_abx[, -c(1:5)])
   # Remove abxs seen less than the minimum, and the NA column
@@ -248,7 +267,65 @@ gen_02 <- function(d2, .specimen_type, min_times_abx=2, min_median_abx=2, min_re
   result$abx_b <- as.numeric(as.factor(colnames(abx)))
   result$n_abx <- ncol(abx)
   result$abx <- abx
-  result$d4 <- d4
+  result$d5 <- d5
+  result$d_abx <- d_abx[, c(1:5)]
+  result
+}
+
+#' Frameshifts antibiotics by multiple days.
+gen03 <- function(d, .specimen_type, min_times_abx=2, min_median_abx=2, min_reads_subj=1, .lag=1) {
+  d <- d %>% filter(specimen_type==.specimen_type) %>%
+    select(specimen_id2, subject_id, study_day, read_count, total_reads, abx_b)
+  # Nest multiple antibiotics into a list-column
+  d2 <- d %>% group_by(specimen_id2) %>%
+    nest(abx_b, .key="abx_nested") %>%
+    left_join(select(d, -abx_b)) %>% 
+    distinct(specimen_id2, .keep_all = TRUE)
+  # Remove subjects with fewer than the min. total reads for the target taxa
+  d3 <- d2 %>% group_by(subject_id) %>%
+    filter(sum(read_count) > min_reads_subj) %>%
+    ungroup()
+  message(sprintf(
+    "Removed %d subjects for having <= %d reads on target", 
+    n_distinct(d2$subject_id)-n_distinct(d3$subject_id), min_reads_subj))
+  
+  # Add lag columns for previous day's proportions and antibiotics
+  d4 <- d3 %>%
+    arrange(subject_id, study_day) %>%
+    group_by(subject_id) %>%
+    mutate(prev = lag(read_count)/lag(total_reads)) %>%
+    mutate(abx_lag = lag(abx_nested, default = list(tibble(abx_b=NA)), lag=.lag)) %>%
+    unnest(abx_lag, .preserve=abx_nested) %>%
+    rename(abx_lag = abx_b) %>%
+    filter(!is.na(prev)) %>%
+    rename(reads=read_count, total=total_reads, specimens=specimen_id2, subjects=subject_id) %>%
+    mutate(abx_yn = ifelse(is.na(abx_lag), 0, 1)) %>% 
+    mutate(abx_lag = ifelse(is.na(abx_lag), "none", abx_lag)) 
+  
+  
+  abx_to_keep <- (d4 %>% group_by(abx_lag, subjects) %>%
+                    filter(abx_lag != "none") %>%
+                    summarize(n=n()) %>% 
+                    mutate(n_subjects=n()) %>%
+                    filter(n_subjects >= min_times_abx, median(n) >= min_median_abx) %>%
+                    distinct(abx_lag))$abx_lag
+  
+  subjects_to_keep <- (filter(d4, abx_lag %in% abx_to_keep) %>% distinct(subjects))$subjects 
+  
+  stopifnot(length(subjects_to_keep) > 0)
+  
+  d5 <- d4 %>% ungroup() %>%
+    filter(subjects %in% subjects_to_keep)
+  d_abx <- d5 %>%
+    reshape2::dcast(subjects + specimens + reads + total + prev ~ abx_lag, value.var="abx_yn", fill=0)
+  result <- tidybayes::compose_data(d_abx[, c(1:5)])
+  abx <- as.matrix(d_abx[, -c(1:5)])
+  # Remove abxs seen less than the minimum, and the NA column
+  abx <- abx[, abx_to_keep, drop=F]
+  result$abx_b <- as.numeric(as.factor(colnames(abx)))
+  result$n_abx <- ncol(abx)
+  result$abx <- abx
+  result$d5 <- d5
   result$d_abx <- d_abx[, c(1:5)]
   result
 }

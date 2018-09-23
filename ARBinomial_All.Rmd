@@ -33,7 +33,7 @@ load_models <- function(glob) {
     }
   }
   paths <- Sys.glob(glob)
-  models <- data.frame(str_split_fixed(paths, "_", 4)[,2:3])
+  models <- data.frame(str_split_fixed(paths, "_", 4)[,2:3, drop=F])
   models$path <- paths
   colnames(models) <- c("lineage", "specimen_type", "path")
   models %>% 
@@ -47,6 +47,10 @@ load_models <- function(glob) {
 }
 models2012 <- load_models("*_2012")
 models2013 <- load_models("*_2013")
+models2014 <- load_models("*_2.0.14_gen01")
+models2015 <- load_models("*_2015")
+models2015.gen2 <- load_models("*_2.0.15_gen02")
+models2016 <- load_models("*_2.0.16_gen02")
 ```
 
 ```{r}
@@ -69,6 +73,45 @@ summarize_model2013 <- function(model, data) {
     spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
     mutate(with_abx = logistic(a + a_subj + (b_abx1 + b_abx2)*0.01 + b_lag*0.01)) %>%
     mutate(without_abx = logistic(a + a_subj + b_lag*0.01)) %>%
+    mutate(difference = with_abx-without_abx) %>%
+    ungroup() %>%
+    mutate(abx=colnames(data$abx)[abx]) %>%
+    group_by(abx, subjects) %>%
+    median_qi(.width=c(0.95, 0.5))
+}
+
+summarize_model2014 <- function(model, data) {
+  # browser()
+  tidybayes::recover_types(model, data$d_abx) %>%
+    spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], b_abx3[subjects,abx], a_subj[subjects]) %>%
+    mutate(with_abx = logistic(a + a_subj + (b_abx1 + b_abx2)*0.01 + b_abx3 + b_lag*0.01)) %>%
+    mutate(without_abx = logistic(a + a_subj + b_lag*0.01)) %>%
+    mutate(difference = with_abx-without_abx) %>%
+    ungroup() %>%
+    mutate(abx=colnames(data$abx)[abx]) %>%
+    group_by(abx, subjects) %>%
+    median_qi(.width=c(0.95, 0.5))
+}
+
+summarize_model2015 <- function(model, data) {
+  # browser()
+  tidybayes::recover_types(model, data$d_abx) %>%
+    spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
+    mutate(with_abx = logistic(a + a_subj - (b_abx1 + b_abx2)*0.5 + b_lag*0.5)) %>%
+    mutate(without_abx = logistic(a + a_subj + b_lag*0.5)) %>%
+    mutate(difference = with_abx-without_abx) %>%
+    ungroup() %>%
+    mutate(abx=colnames(data$abx)[abx]) %>%
+    group_by(abx, subjects) %>%
+    median_qi(.width=c(0.95, 0.5))
+}
+
+summarize_model2016 <- function(model, data) {
+  # browser()
+  tidybayes::recover_types(model, data$d_abx) %>%
+    spread_draws(a, b_lag, b_abx2[subjects, abx], b_abx1[abx], a_subj[subjects]) %>%
+    mutate(with_abx = logistic(a + a_subj + (b_abx1 + b_abx2)*(1-0.5) + b_lag*0.5)) %>%
+    mutate(without_abx = logistic(a + a_subj + b_lag*0.5)) %>%
     mutate(difference = with_abx-without_abx) %>%
     ungroup() %>%
     mutate(abx=colnames(data$abx)[abx]) %>%
@@ -99,10 +142,59 @@ draws2013 <- plyr::ddply(models2013, c("lineage", "specimen_type"), function(df)
   summary$lineage <- lineage
   return(summary)
 })
+
+draws2014 <- plyr::ddply(models2014, c("lineage", "specimen_type"), function(df) {
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model2014(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  return(summary)
+})
+draws2014 <- with(data.frame(), {
+  df <- models2014
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model2014(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  summary
+})
+
+draws2015 <- with(data.frame(), {
+  df <- models2015.gen2
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model2015(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  summary
+})
+draws2016 <- with(data.frame(), {
+  df <- models2016
+  lineage <- as.character(unique(df$lineage))
+  specimen_type <- as.character(unique(df$specimen_type))
+  print(sprintf("%s, %s", lineage, specimen_type))
+  model <- df$model[[1]]
+  data <- df$df[[1]]
+  summary <- summarize_model2016(model, data)
+  summary$specimen_type <- specimen_type
+  summary$lineage <- lineage
+  summary
+})
 ```
 
 ```{r}
-draws2012 %>% 
+draws2014 %>% 
   filter(.width == 0.5) %>%
   ggplot(aes(x=abx, y=difference, group=subjects, color=difference<0)) +
   geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
@@ -142,5 +234,73 @@ draws2012 %>%
     x="antibiotic", y="Delta %", title="Antibiotic effects on bacterial lineage by specimen type", 
     caption="Change in likelihood of seeing the bacteria before and after antibiotic administration")
 ggsave("figures/m2012_abx_effect_by_lineage.pdf", width=18, height=7)
+```
+
+
+```{r}
+draws2015 %>% 
+  filter(.width == 0.5) %>%
+  ggplot(aes(x=abx, y=-b_abx2, group=subjects, color=difference<0)) +
+  geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
+  geom_pointinterval(
+    aes(ymin=-b_abx2.lower, ymax=-b_abx2.upper),
+    position=position_dodge(width=0.8), 
+    size_range = c(0.2, 0.5), alpha=0.4, show.legend=TRUE) +
+  scale_y_continuous(labels=scales::percent, breaks = scales::pretty_breaks()) +
+  scale_size_continuous(guide = F) +
+  scale_color_discrete("", labels=c("TRUE"="Decrease in likelihood", "FALSE"="Zero or increase in likelihood")) +
+  facet_grid(rows=vars(specimen_type), cols=vars(lineage), scales="free") +
+  theme_bw()+
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+```{r}
+draws2014 %>% 
+  filter(.width == 0.5) %>%
+  ggplot(aes(x=abx, y=b_abx1, group=subjects, color=difference<0)) +
+  geom_hline(aes(yintercept=0), linetype="dashed", color="grey40") +
+  geom_pointinterval(
+    aes(ymin=b_abx1.lower, ymax=b_abx1.upper),
+    position=position_dodge(width=0.8), 
+    size_range = c(0.2, 0.5), alpha=0.4, show.legend=TRUE) +
+  scale_y_continuous(labels=scales::percent, breaks = scales::pretty_breaks()) +
+  scale_size_continuous(guide = F) +
+  scale_color_discrete("", labels=c("TRUE"="Decrease in likelihood", "FALSE"="Zero or increase in likelihood")) +
+  facet_grid(rows=vars(specimen_type), cols=vars(lineage), scales="free") +
+  theme_bw()+
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+```{r}
+models2016$df[[1]]$d5 %>%
+  filter(abx_lag %in% c("none", "cefepime")) %>%
+  mutate(delta = (reads/total)-prev) %>%
+  ggplot(aes(study_day, delta)) +
+  geom_hline(aes(yintercept=0)) +
+  geom_line() +
+  geom_point(aes(color=abx_lag)) +
+  # geom_quasirandom(aes(color=delta > 0)) +
+  facet_wrap(vars(subjects), scales="free")
+```
+
+```{r}
+d2$d5 %>%
+  filter(abx_lag %in% c("none", "cefepime")) %>%
+  group_by(subjects) %>%
+  mutate(delta = reads-lag(reads)) %>%
+  # mutate(delta = (reads/total)-prev) %>%
+  ggplot(aes(abx_lag, delta)) +
+  geom_hline(aes(yintercept=0)) +
+  # geom_line() +
+  geom_point(aes(color=abx_lag)) +
+  # geom_quasirandom(aes(color=delta > 0)) +
+  facet_wrap(vars(subjects), scales="free")
+```
+
+```{r}
+d2$d5 %>% filter(abx_lag %in% c("none", "cefepime")) %>%
+  
 ```
 
